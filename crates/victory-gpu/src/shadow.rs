@@ -46,6 +46,9 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, by title page, covering
     /// the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
+    /// The last presented frame at which a draw asked for it (loose
+    /// windows only: see [`loose_trim`]).
+    used: AtomicU64,
 }
 
 /// A copy's bytes before a submission ran.
@@ -137,6 +140,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            used: AtomicU64::new(crate::queue::presented()),
         }
     }
 
@@ -572,6 +576,21 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
+        shadow.used.store(crate::queue::presented(), Ordering::Relaxed);
+        return Some(shadow.clone());
+    }
+    // With trimming on, any window already covering the range serves it
+    // (keys are exact, so ranges starting in one window and ending in
+    // different ones each made an overlapping copy of their own).
+    if loose_trim().is_some()
+        && let Some(shadow) = map
+            .range(..=(address, u64::MAX))
+            .rev()
+            .take(64)
+            .map(|(_, s)| s)
+            .find(|s| s.start <= address && s.start + s.len >= end)
+    {
+        shadow.used.store(crate::queue::presented(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -586,6 +605,42 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// `VICTORY_LOOSE_TRIM=<frames>` (off by default): loose windows no draw
+/// has asked for in that many presented frames are dropped, and a range
+/// inside an existing window reuses it. Without it every window ever
+/// touched is kept (a Series S world run held 646 of them, 2.6 GB of
+/// system memory the GPU reads, with Windows nearly out of commit). A
+/// list still holding a dropped window keeps it until it is reset; a range
+/// asked for again gets a new window, copied whole from title memory
+/// (anything shaders wrote has gone back there already).
+pub(crate) fn loose_trim() -> Option<u64> {
+    static TRIM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TRIM.get_or_init(|| {
+        let frames = std::env::var("VICTORY_LOOSE_TRIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)?;
+        tracing::warn!(frames, "VICTORY_LOOSE_TRIM: unused loose memory copies are dropped");
+        Some(frames)
+    })
+}
+
+/// At a present: with [`loose_trim`] on, every 30 frames, drops the loose
+/// windows not asked for in the last `frames` frames.
+pub(crate) fn trim_loose(frame: u64) {
+    let Some(frames) = loose_trim() else { return };
+    if !frame.is_multiple_of(30) {
+        return;
+    }
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let before = map.len();
+    map.retain(|_, s| frame.saturating_sub(s.used.load(Ordering::Relaxed)) <= frames);
+    let dropped = before - map.len();
+    if dropped > 0 {
+        tracing::debug!(dropped, kept = map.len(), "loose memory copies dropped");
+    }
 }
 
 /// For device-removed reports: the copy of title memory whose host range

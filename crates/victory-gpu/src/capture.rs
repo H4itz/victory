@@ -275,6 +275,10 @@ pub(crate) fn show_index() -> Option<Show> {
     })
 }
 
+/// The layer show mode `busiest` presented last, kept to show again.
+static LAST_SHOWN: std::sync::Mutex<Option<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(None);
+
 /// Draws that wrote each noted target this frame (show mode `busiest`).
 static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
 
@@ -299,18 +303,40 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
     }
     let pick = match show {
         Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
-        Show::Busiest => targets
-            .iter()
-            .filter(|(_, c)| {
-                // SAFETY: a live resource.
-                let d = unsafe { c.texture.GetDesc() };
-                d.Width >= 1280
-                    // Screen-shaped (16:9): not a shadow map, which more draws write.
-                    && d.Width * 9 == u64::from(d.Height) * 16
-                    && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
-            })
-            .max_by_key(|(r, _)| hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1))
-            .map(|(_, c)| c.clone()),
+        Show::Busiest => {
+            let draws = |r: usize| hits.iter().find(|h| h.0 == r).map_or(0, |h| h.1);
+            let candidates: Vec<&(usize, std::sync::Arc<crate::resource::HostTexture>)> = targets
+                .iter()
+                .filter(|(_, c)| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { c.texture.GetDesc() };
+                    d.Width >= 1280
+                        // Screen-shaped (16:9): not a shadow map, which more draws write.
+                        && d.Width * 9 == u64::from(d.Height) * 16
+                        && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
+                })
+                .collect();
+            let busiest = candidates.iter().max_by_key(|(r, _)| draws(*r));
+            let mut last = LAST_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep the layer shown last while it has at least half the
+            // busiest one's draws: switching layers frame to frame flickers.
+            let kept = last.as_ref().and_then(|(lr, _)| {
+                let most = busiest.map_or(0, |(r, _)| draws(*r));
+                candidates
+                    .iter()
+                    .find(|(r, _)| r == lr && draws(*r) > 0 && 2 * draws(*r) >= most)
+            });
+            match kept.or(busiest) {
+                Some((r, c)) => {
+                    *last = Some((*r, c.clone()));
+                    Some(c.clone())
+                }
+                // A frame with no such layer (a loading screen's UI-only
+                // frame) shows the last one again rather than the title's
+                // own picture, which on the Series S path is black.
+                None => last.as_ref().map(|(_, c)| c.clone()),
+            }
+        }
     };
     if !(dump_on() && listed(frame)) {
         targets.clear();
