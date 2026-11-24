@@ -325,7 +325,14 @@ pub(crate) fn shown(frame: u64) -> Option<Shown> {
                     d.Width >= 1280
                         // Screen-shaped (16:9): not a shadow map, which more draws write.
                         && d.Width * 9 == u64::from(d.Height) * 16
-                        && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
+                        // A G-buffer's base colour is 8-bit colour; wider
+                        // formats hold packed data (normals, motion), which
+                        // shows as stripes. Any colour format without a slot.
+                        && if slot.is_some() {
+                            matches!(d.Format.0, 27..=29 | 87 | 90 | 91)
+                        } else {
+                            matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
+                        }
                 })
                 // Not the UI layer drawn over it, nor another slot's.
                 .filter(|(r, _)| overlay.as_ref().is_none_or(|(o, _)| o != r))
@@ -337,6 +344,32 @@ pub(crate) fn shown(frame: u64) -> Option<Shown> {
                 .iter()
                 .max_by_key(|(r, _)| (draws(*r), std::cmp::Reverse(slot_of(*r).unwrap_or(u8::MAX))));
             let mut last = LAST_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+            // Which layer, and what else there was, when the choice changes.
+            if let Some((r, _)) = busiest
+                && last.as_ref().is_none_or(|(lr, _)| lr != r)
+            {
+                let describe = |r: usize| {
+                    let c = targets.iter().find(|t| t.0 == r).map(|t| &t.1);
+                    // SAFETY: live resources.
+                    let d = c.map(|c| unsafe { c.texture.GetDesc() });
+                    format!(
+                        "{:#x} {}x{} f{} slot {:?} {} draws",
+                        r,
+                        d.map_or(0, |d| d.Width),
+                        d.map_or(0, |d| d.Height),
+                        d.map_or(0, |d| d.Format.0),
+                        slot_of(r),
+                        draws(r)
+                    )
+                };
+                let others: Vec<String> = targets
+                    .iter()
+                    .filter(|t| draws(t.0) > 0 && t.0 != *r)
+                    .map(|t| describe(t.0))
+                    .take(16)
+                    .collect();
+                tracing::info!(frame, chosen = %describe(*r), ?others, "show mode: layer chosen");
+            }
             // Keep the layer shown last while it has at least half the
             // busiest one's draws: switching layers frame to frame flickers.
             let kept = last.as_ref().and_then(|(lr, _)| {
