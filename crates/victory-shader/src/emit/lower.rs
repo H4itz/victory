@@ -162,6 +162,10 @@ struct Lower<'a> {
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
+    /// Descriptor dwords with no host value (addresses, formats, all of a
+    /// constant buffer's): no program reads them as numbers ([`Self::dead`]).
+    /// (From the fxceless fork.)
+    stale: HashSet<Value>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -960,6 +964,7 @@ impl<'a> Lower<'a> {
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
+            stale: HashSet::new(),
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
@@ -3452,6 +3457,37 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether `v` is a register no program reads as a number: a
+    /// descriptor dword without a host value ([`Self::stale`]), a lane
+    /// mask's dword (outside compute, where a ballot gives the mask as
+    /// data), or a join of only such values. Compiled code joins numbers
+    /// with numbers: where one of these meets numbers at a join, the
+    /// register is dead on that path (a variable set in one arm of a
+    /// branch, its use behind a flag kept in a VGPR). (From the fxceless
+    /// fork.)
+    fn dead(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        if self.stale.contains(&v) {
+            return true;
+        }
+        let st = self.x.st;
+        if self.mask_data != MaskData::Console
+            && (st.masks.contains_key(&v) || st.highs.contains_key(&v))
+        {
+            return true;
+        }
+        let Some(&(b, i)) = self.phi_at.get(&v) else {
+            return false;
+        };
+        if seen.contains(&v) {
+            return true;
+        }
+        seen.push(v);
+        self.x.p.blocks[b].phis[i]
+            .args
+            .iter()
+            .all(|&a| self.dead(a, seen))
+    }
+
     fn is_mask(&self, v: Option<Value>) -> bool {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
     }
@@ -4138,19 +4174,42 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
+        // How the program uses the descriptor tells the view's kind: an
+        // image or buffer instruction before a scalar buffer load, which
+        // reads any buffer. (From the fxceless fork.)
+        let x = self.x;
+        let uses = |of: Site| {
+            x.res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .filter_map(move |d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
+                        _ => None,
+                    })
                 })
-            });
+        };
+        let by_scalar_load =
+            |u: &(Site, u8)| matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. });
+        let use_of = |of: Site| uses(of).find(|u| !by_scalar_load(u)).or_else(|| uses(of).next());
+        // The console compiler loads a descriptor again wherever it needs
+        // it, and for a size it reads the dwords of a load that nothing
+        // uses as a descriptor. Another load of as many dwords from the
+        // same address reads the same descriptor, so what uses that one
+        // tells this one's kind; the handle is still made from this load's
+        // own operands.
+        let address = self.scalar.get(&site).copied();
+        let twin = || {
+            let a = address?;
+            let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
+            x.res
+                .scalar
+                .iter()
+                .filter(|(s, b)| *s != site && *b == a && same(*s))
+                .find_map(|(s, _)| use_of(*s))
+        };
+        let use_at = use_of(site).or_else(twin);
         let (src, uav, props, image) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);
@@ -4185,9 +4244,20 @@ impl<'a> Lower<'a> {
                         (11 | u, 0)
                     };
                     if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        self.stale.extend(inst.writes.iter().map(|w| w.1));
                         return Err("a constant buffer's descriptor read as data");
                     }
                     (props, None)
+                }
+                // Read by scalar buffer loads alone: the raw view `smem`
+                // reads it through. (From the fxceless fork.)
+                Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                    ((11, 0), None)
+                }
+                // A constant buffer: nothing of its descriptor is a number.
+                Fields::Smem { .. } => {
+                    self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
                 }
                 _ => return Err("a scalar memory read as data"),
             };
@@ -4201,7 +4271,8 @@ impl<'a> Lower<'a> {
                 return Err("a descriptor read only as data");
             };
             if used.kind == ResourceType::Cbv {
-                return Err("a constant buffer's descriptor read as data");
+                self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
             }
             if !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
                 return Err("a descriptor read only as data");
@@ -4283,6 +4354,7 @@ impl<'a> Lower<'a> {
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
+                        self.stale.insert(v);
                     }
                 }
             }
@@ -7107,7 +7179,8 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            // `_cl`: a level-of-detail clamp after the coordinates.
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -7177,7 +7250,9 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // A cube's gradients are the two of its face coordinates.
+            let per_axis = if kind == 5 { 2 } else { spatial };
+            let grads = if op == 63 { 2 * per_axis } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -7193,8 +7268,8 @@ impl<'a> Lower<'a> {
                 *slot = to_float(self, x);
             }
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 || (op == 63 && *a16) {
+                    return Err("a cube sample with texel coordinates, 16-bit gradients or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -7286,6 +7361,52 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
+                63 if kind == 5 => {
+                    // A cube with explicit gradients: the host wants them
+                    // as changes of the direction, the console gives the
+                    // changes of the face coordinates (the face is one
+                    // unit wide). The level they select is taken from the
+                    // longer of the two, in texels, and sampled directly.
+                    // shortcut: no anisotropic filtering for these samples
+                    // (the longer axis alone decides the level); the clamp
+                    // of `_cl` is left out. (From the fxceless fork.)
+                    let mut len = [fu; 2];
+                    for (axis, slot) in len.iter_mut().enumerate() {
+                        let mut sum = self.s.m.f32(0);
+                        for k in 0..2 {
+                            let x = addr_val(self, first + axis * per_axis + k)?;
+                            let x = to_float(self, x);
+                            let sq = self.s.m.bin(c, Bin::Mul, x, x);
+                            sum = self.s.m.bin(c, Bin::Add, sum, sq);
+                        }
+                        *slot = self.unary(24, sum); // square root
+                    }
+                    let longer = self.binary(35, len[0], len[1]); // maximum
+                    let i32t = self.s.t.i32;
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let z = self.s.m.i32(0);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                    let width = self.s.m.extract(c, d, 0);
+                    let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
+                    let texels = self.s.m.bin(c, Bin::Mul, longer, width);
+                    // log2 = natural logarithm / ln 2; a length of 0 gives
+                    // minus infinity, which the sampler clamps to level 0.
+                    let ln = self.unary(23, texels);
+                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
+                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    args.extend(&os);
+                    args.push(lod);
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
+                        &args,
+                    )
+                }
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
@@ -7296,7 +7417,13 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    let clamp = if name.ends_with("_cl") {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -8260,6 +8387,18 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // A join of numbers with dead registers (`dead`): the paths
+            // that bring those never read the result, so they bring zero.
+            // Not for a join that is itself a lane mask (a ballot gives
+            // that one as data). (From the fxceless fork.)
+            let st = self.x.st;
+            let numbers = !bit
+                && !st.masks.contains_key(&phi.value)
+                && !st.highs.contains_key(&phi.value)
+                && phi
+                    .args
+                    .iter()
+                    .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -8267,6 +8406,11 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    (Some(Val::Missing(_)) | None, false)
+                        if numbers && self.dead(arg, &mut Vec::new()) =>
+                    {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
