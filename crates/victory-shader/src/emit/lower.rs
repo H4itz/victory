@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -1950,11 +1951,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -4654,7 +4657,17 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    // A root UAV: a raw buffer whether the access reads
+                    // (11) or writes (11 with the UAV bit). Indexed
+                    // accesses reach here as raw ones at index times the
+                    // entry's stride (`buffer`). (From the fxceless fork.)
+                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
+                        Ok(self.s.root_uav_handle(rp.slot))
+                    }
+                    (RootType::Descriptor, Some(ResourceType::Srv), 0x100b) => {
+                        Err("a write through a root SRV")
+                    }
+                    _ => Err("a typed root view"),
                 }
             }
             Source::Phi { block, args } => {
@@ -7776,6 +7789,20 @@ impl<'a> Lower<'a> {
             && used.is_none()
         {
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
+            off = self.s.m.bin(c, Bin::Add, at, off);
+            index = None;
+        }
+        // A root UAV is bound as a raw view: an indexed access becomes a
+        // raw one at index times its used-resource entry's stride.
+        if let (Some(element), Some(u), Source::Built { .. }) = (index, used, src)
+            && !typed
+            && u.kind == ResourceType::Uav
+            && u.root == RootType::Descriptor
+            && u.stride >= 4
+            && u.stride.is_multiple_of(4)
+        {
+            let k = self.s.m.i32(u.stride);
+            let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
         }

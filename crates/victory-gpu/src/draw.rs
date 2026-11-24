@@ -580,6 +580,40 @@ impl State {
                     }
                 }
             }
+            for &(slot, param) in &stage.root_uavs {
+                // A root UAV: the title buffer's host copy from the address
+                // on, brought up to date before the list runs and copied
+                // back into title memory after it (what the shader stored).
+                // shortcut: a root view has no size: the refresh and the
+                // copy back cover all that is left of the title's buffer.
+                // (From the fxceless fork.)
+                let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                    once!(slot, "a shader writes through a root view the title did not set: the draw is dropped");
+                    return false;
+                };
+                let Some(shadow) = crate::shadow::find(address, 1) else {
+                    once!("a root UAV outside title buffers: the draw is dropped");
+                    return false;
+                };
+                // SAFETY: a live buffer.
+                let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+                if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+                    once!("a root UAV of a buffer whose host copy shaders cannot write: the draw is dropped");
+                    return false;
+                }
+                let len = shadow.left(address);
+                shadow.refresh(list, address, len);
+                shadow.gpu_writes(list, address, len);
+                let gpu = shadow.gpu(address);
+                // SAFETY: an open list; the list keeps the copy alive.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootUnorderedAccessView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                    }
+                }
+            }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
