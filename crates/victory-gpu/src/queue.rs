@@ -828,7 +828,23 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // With `VICTORY_COMPOSE_UI`: the UI layer blended over the picture.
+        let composed = match (crate::uilayer::mode(), crate::uilayer::take()) {
+            (Some(straight), Some(ui)) => {
+                let mut layers = Vec::with_capacity(2);
+                if ui.texture != *texture {
+                    layers.push((texture, crate::host::legal_state(texture, state)));
+                }
+                let ui_state = crate::host::legal_state(&ui.texture, ui.state.load(Ordering::Relaxed));
+                layers.push((&ui.texture, ui_state));
+                host.present_layers(&layers, straight, frame)
+            }
+            _ => None,
+        };
+        let shown = match composed {
+            Some(black) => Some(black),
+            None => host.present(texture, state, frame),
+        };
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

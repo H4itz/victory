@@ -6721,6 +6721,100 @@ impl Host {
         }
     }
 
+    /// Presents `layers` (texture, state) drawn one over another
+    /// ([`crate::compose`]), the swap chain sized to the largest: the
+    /// picture and the UI layer over it ([`crate::uilayer`]). `None` if
+    /// composition is not available; the caller then presents the picture
+    /// alone.
+    pub(crate) fn present_layers(
+        &self,
+        layers: &[(&ID3D12Resource, u32)],
+        straight: bool,
+        frame: u64,
+    ) -> Option<bool> {
+        let compose = crate::compose::get(&self.device)?;
+        let (width, height) = layers
+            .iter()
+            .map(|(t, _)| {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                (d.Width as u32, d.Height)
+            })
+            .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))?;
+        let format = crate::compose::FORMAT;
+        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        if presenter.is_none() {
+            *presenter = match self.presenter(width, height, format) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no swap chain");
+                    return None;
+                }
+            };
+        }
+        let p = presenter.as_mut()?;
+        if (p.width, p.height, p.format) != (width, height, format) {
+            // Presents sent ahead hold back buffers until they have run.
+            settle_now(WHY_SYNC);
+            // SAFETY: no back buffer is held; every submission was waited for.
+            let resized = unsafe {
+                p.swap_chain
+                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            };
+            match resized {
+                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Err(e) => {
+                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    return None;
+                }
+            }
+        }
+        let drawn: Vec<crate::compose::Layer<'_>> = layers
+            .iter()
+            .map(|&(texture, state)| crate::compose::Layer {
+                texture,
+                state: D3D12_RESOURCE_STATES(legal_state(texture, state) as i32),
+            })
+            .collect();
+        // SAFETY: our swap chain and list (run and waited for below, as a
+        // present that is not sent ahead); live layer textures.
+        unsafe {
+            let index = p.swap_chain.GetCurrentBackBufferIndex();
+            let back = p.swap_chain.GetBuffer::<ID3D12Resource>(index).ok()?;
+            p.copy.reset();
+            if !compose.record(&self.device, &p.copy.list, &back, (width, height), &drawn, straight) {
+                p.copy.close();
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            let capture = crate::capture::wanted(frame).then(|| {
+                p.copy.list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let read = crate::capture::read_back(&self.device, &p.copy.list, &back);
+                p.copy.list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+                read
+            });
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = frame;
+            p.copy.close();
+            self.execute(&[&p.copy]);
+            #[cfg(feature = "diagnostics")]
+            if let Some(Some((buffer, footprint))) = capture {
+                crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            p.meter.frame(p.hwnd);
+        }
+        Some(false)
+    }
+
     fn presenter(
         &self,
         width: u32,
