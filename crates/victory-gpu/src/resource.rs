@@ -286,15 +286,51 @@ fn host_lacks_target(_: u32) -> bool {
     false
 }
 
+/// R9G9B9E5_SHAREDEXP, the console's packed HDR format.
+pub(crate) const SHAREDEXP: u32 = 67;
+/// R16G16B16A16_FLOAT, which stands in for it as a render target or
+/// unordered-access texture (see [`target_format`]).
+pub(crate) const RGBA16_FLOAT: u32 = 10;
+
+/// `VICTORY_SHAREDEXP_TARGETS=1` (off by default): render-target and
+/// unordered-access textures in R9G9B9E5_SHAREDEXP are made
+/// R16G16B16A16_FLOAT on the host, as are their views and the pipelines
+/// that draw to them. PC GPUs cannot render to or write that format, so
+/// without this the host copy is refused (E_INVALIDARG) and everything the
+/// title draws into it is lost: on the Series S path Grand Theft Auto VI
+/// asks for 1920x1080 targets of it before its first picture. Each channel
+/// keeps its value (half floats hold more mantissa, less range: values
+/// above 65504 clamp). shortcut: title data uploaded into such a texture,
+/// or copies between it and a sampled-only texture of the same format,
+/// are not converted.
+pub(crate) fn sharedexp_targets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_SHAREDEXP_TARGETS").is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")
+        });
+        if on {
+            tracing::warn!(
+                "VICTORY_SHAREDEXP_TARGETS: R9G9B9E5 render targets are R16G16B16A16_FLOAT on the host"
+            );
+        }
+        on
+    })
+}
+
 /// The format a render target or unordered-access texture of `format` is
 /// made in on the host, and that render target views and pipelines name:
 /// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
-/// write typed (each channel keeps its value, with more precision); else
-/// the format as the host has it. Textures only sampled keep theirs.
+/// write typed (each channel keeps its value, with more precision);
+/// R16G16B16A16_FLOAT for R9G9B9E5_SHAREDEXP with
+/// `VICTORY_SHAREDEXP_TARGETS` ([`sharedexp_targets`]); else the format as
+/// the host has it. Textures only sampled keep theirs.
 pub(crate) fn target_format(format: u32) -> u32 {
     let format = pc_format(format);
     if PACKED_16.contains(&format) && host_lacks_target(format) {
         RGBA8_UNORM
+    } else if format == SHAREDEXP && sharedexp_targets() {
+        RGBA16_FLOAT
     } else {
         format
     }
@@ -2486,6 +2522,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                 );
             } else if (118..=120).contains(&format) {
                 assert_eq!(target_format(format), format - 118 + 45);
+            } else if format == SHAREDEXP {
+                let expected = if sharedexp_targets() { RGBA16_FLOAT } else { SHAREDEXP };
+                assert_eq!(target_format(format), expected);
             } else {
                 assert_eq!(target_format(format), format, "format {format}");
             }
