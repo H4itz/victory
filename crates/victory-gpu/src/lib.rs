@@ -23,6 +23,8 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod compose;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
@@ -53,6 +55,8 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod uilayer;
 #[cfg(windows)]
 mod watch;
 
