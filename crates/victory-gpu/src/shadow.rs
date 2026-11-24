@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -124,6 +124,8 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        LIVE.0.fetch_add(len, Ordering::Relaxed);
+        LIVE.1.fetch_add(1, Ordering::Relaxed);
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
             buffer,
@@ -221,7 +223,18 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let written = self.sync_back(address, len);
+        self.release(address, len);
+        written
+    }
+
+    /// The byte part of [`Shadow::copy_back`]: what the GPU wrote of
+    /// `[address, address + len)` goes to title memory. Calling it once for
+    /// the union of overlapping declared ranges (all declared by the same
+    /// submission, so each page's snapshot covers the union) does the work
+    /// of calling it for each, without walking the shared pages again.
+    pub(crate) fn sync_back(&self, address: usize, len: usize) -> usize {
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -284,6 +297,14 @@ impl Shadow {
                 }
             }
         }
+        written
+    }
+
+    /// The bookkeeping part of [`Shadow::copy_back`], once per declared
+    /// range: the range is no longer being written, and with the last one
+    /// the snapshot goes back to the pool.
+    pub(crate) fn release(&self, address: usize, len: usize) {
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -292,7 +313,6 @@ impl Shadow {
             let taken = std::mem::take(&mut *snapshot);
             give_back(taken.pages.into_values().map(|s| s.bytes));
         }
-        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -399,6 +419,72 @@ impl Shadow {
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
     }
+}
+
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        LIVE.0.fetch_sub(self.len, Ordering::Relaxed);
+        LIVE.1.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Bytes and number of live host copies (title buffers and loose windows).
+static LIVE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+
+/// For the memory line: `(buffer copy bytes, buffer copies, loose window
+/// bytes, loose windows, snapshot pool bytes)`. Buffer copies include ones
+/// whose title buffer is released but a list still holds.
+pub(crate) fn host_copy_bytes() -> (u64, u64, u64, u64, u64) {
+    let (loose, loose_count) = LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .fold((0, 0), |(b, n), s| (b + s.len, n + 1));
+    let pool = PAGES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64 * PAGE as u64;
+    let (all, count) = (LIVE.0.load(Ordering::Relaxed), LIVE.1.load(Ordering::Relaxed));
+    (
+        all.saturating_sub(loose),
+        count.saturating_sub(loose_count),
+        loose,
+        loose_count,
+        pool,
+    )
+}
+
+/// `VICTORY_COPY_BACK_MERGE=1` (off by default): after a submission, the
+/// ranges its shaders wrote are copied back to title memory once per union
+/// of overlapping or touching ranges of each host copy, not once per
+/// declared range. The world declares dozens of overlapping views of its
+/// 174 MB heap per submission, and each later walk compared and re-read
+/// (through the kernel) the pages an earlier one had already put back; a
+/// title write landing between two walks could also be overwritten with
+/// the GPU's older bytes by the second.
+pub(crate) fn merge_copy_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_COPY_BACK_MERGE").is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")
+        });
+        if on {
+            tracing::warn!("VICTORY_COPY_BACK_MERGE: shader writes copied back once per merged range");
+        }
+        on
+    })
+}
+
+/// Unions of `[from, to)` ranges that overlap or touch exactly (no page
+/// rounding: a gap between two ranges was not declared written).
+pub(crate) fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|&(a, b)| a < b);
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match merged.last_mut() {
+            Some((_, end)) if a <= *end => *end = (*end).max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
 }
 
 struct Entry {
@@ -591,6 +677,51 @@ mod tests {
         }
         assert!(shadow.before.lock().unwrap().pages.is_empty());
         assert!(PAGES.lock().unwrap().len() >= 3);
+        drop(memory);
+    }
+
+    #[test]
+    fn merged_ranges_join_only_overlapping_or_touching() {
+        assert_eq!(
+            merge_ranges(vec![(10, 20), (0, 5), (15, 30), (30, 31), (40, 40), (35, 36)]),
+            [(0, 5), (10, 31), (35, 36)]
+        );
+    }
+
+    /// Overlapping ranges put back as one union (`VICTORY_COPY_BACK_MERGE`)
+    /// leave title memory as putting each back did, and the snapshot is
+    /// released only with the last range.
+    #[test]
+    fn merged_copy_back_matches_per_range() {
+        let mut memory = vec![2u8; 4 * PAGE];
+        let base = (memory.as_mut_ptr() as usize).next_multiple_of(PAGE) + 64;
+        let Some(shadow) = shadow_of(base, 2 * PAGE + 100) else {
+            return;
+        };
+        let (a, b) = ((base + 10, PAGE), (base + PAGE - 100, PAGE));
+        shadow.writing(a.0, a.1);
+        shadow.writing(b.0, b.1);
+        // SAFETY: bytes of the copy and of the title range, which nothing
+        // else uses: GPU writes in both ranges and in their overlap.
+        unsafe {
+            shadow.data.add(20).write(0x11);
+            shadow.data.add(PAGE - 50).write(0x22);
+            shadow.data.add(PAGE + 200).write(0x33);
+        }
+        let merged = merge_ranges(vec![(a.0, a.0 + a.1), (b.0, b.0 + b.1)]);
+        assert_eq!(merged.len(), 1);
+        let (from, to) = merged[0];
+        assert!(shadow.sync_back(from, to - from) > 0);
+        shadow.release(a.0, a.1);
+        assert!(!shadow.before.lock().unwrap().pages.is_empty(), "kept for the second range");
+        shadow.release(b.0, b.1);
+        assert!(shadow.before.lock().unwrap().pages.is_empty());
+        // SAFETY: title memory of ours.
+        unsafe {
+            let title = |at: usize| (base as *const u8).add(at).read();
+            assert_eq!((title(20), title(PAGE - 50), title(PAGE + 200)), (0x11, 0x22, 0x33));
+            assert_eq!(title(30), 2);
+        }
         drop(memory);
     }
 

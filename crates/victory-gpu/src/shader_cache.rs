@@ -70,7 +70,8 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// diagnostics build can change at run time, and the experimental
+/// `VICTORY_READFIRSTLANE_HALF`).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -82,9 +83,19 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let half = victory_shader::emit::readfirstlane_half();
+        if half {
+            tracing::warn!(
+                "VICTORY_READFIRSTLANE_HALF: divergent v_readfirstlane reads the host half's first lane"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // Only when on, so entries made with it off keep their key.
+                if half {
+                    bytes.extend_from_slice(b"readfirstlane-half");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -103,7 +114,10 @@ fn build() -> &'static [u8; 32] {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let wave64 = effective_wave64_mode();
-    let options = TranslateOptions { wave64 };
+    let options = TranslateOptions {
+        wave64,
+        readfirstlane_half: victory_shader::emit::readfirstlane_half(),
+    };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {

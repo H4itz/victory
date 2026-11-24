@@ -127,6 +127,35 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Experimental, off unless `VICTORY_READFIRSTLANE_HALF=1`: in
+/// [`Wave64Mode::Wave32`], a `v_readfirstlane_b32` of a non-uniform value
+/// in divergent control flow reads the first active lane of the host's
+/// 32-lane half (one `WaveActiveBallot` and one `WaveReadLaneAt`) instead
+/// of failing the translation. The exact 64-lane answer needs group-shared
+/// memory and barriers, which divergent control flow cannot run. Both
+/// halves agree whenever the value is the same in all active lanes, and
+/// waterfall loops still terminate (each half walks its own values); a
+/// pattern that broadcasts one lane's result to the whole 64-lane wave
+/// (an atomic append's base, say) gets a different lane's value in the
+/// second half. Part of the translation, so the shader cache keys on it.
+pub fn readfirstlane_half() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_switch(std::env::var("VICTORY_READFIRSTLANE_HALF").ok().as_deref())
+    })
+}
+
+/// An on/off environment switch: `1`, `on`, `true` or `yes` turn it on.
+/// Pure, for testing.
+fn parse_switch(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        )
+    })
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -207,6 +236,9 @@ pub enum Wave64Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TranslateOptions {
     pub wave64: Wave64Mode,
+    /// Experimental: see [`readfirstlane_half`] (the environment switch
+    /// that `victory-gpu` passes here).
+    pub readfirstlane_half: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -458,7 +490,18 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_loop_limit, parse_switch};
+
+    #[test]
+    fn on_off_switches_parse() {
+        for on in ["1", "on", "TRUE", " yes "] {
+            assert!(parse_switch(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "off", "2", "half"] {
+            assert!(!parse_switch(Some(off)), "{off:?}");
+        }
+        assert!(!parse_switch(None));
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

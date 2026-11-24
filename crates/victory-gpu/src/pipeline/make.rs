@@ -157,14 +157,36 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// How many workers make pipelines: `VICTORY_PIPELINE_WORKERS` (1 to 16)
+/// if set, else half the logical processors, 2 to 8. Each runs our
+/// translation and then the driver's compile, which for the world's big
+/// compute programs holds hundreds of MiB for a moment; fewer workers
+/// lower that peak and take longer to drain the queue.
+fn worker_count() -> usize {
+    let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+    let set = std::env::var("VICTORY_PIPELINE_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=16).contains(n));
+    match set {
+        Some(n) => {
+            tracing::warn!(workers = n, default, "VICTORY_PIPELINE_WORKERS: pipeline workers set");
+            n
+        }
+        None => {
+            tracing::info!(workers = default, "pipeline workers");
+            default
+        }
+    }
+}
+
+/// Hands `p` to the workers ([`worker_count`]), started on first use.
 fn queue(p: Arc<Pending>) {
     static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
@@ -179,6 +201,8 @@ fn queue(p: Arc<Pending>) {
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         let Ok(p) = next else { return };
+                        // Optional: no new compile while commit is short.
+                        crate::memstat::wait_for_commit();
                         p.make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();

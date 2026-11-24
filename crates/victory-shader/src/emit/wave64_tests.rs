@@ -220,7 +220,10 @@ fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, Shade
         &st,
         &io_res,
         &res,
-        TranslateOptions { wave64: mode },
+        TranslateOptions {
+            wave64: mode,
+            ..Default::default()
+        },
     )
 }
 
@@ -314,6 +317,61 @@ fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
             "expected safe error for divergent ballot in {mode:?}, got {err:?}"
         );
     }
+}
+
+fn emit_cs_with(native: &NativeProgram, options: TranslateOptions) -> Result<HostShader, ShaderError> {
+    let dxbc = empty_dxbc();
+    let container = Container::parse(&dxbc)?;
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let res = resource::track(&p, &native.layout, native.stage)?;
+    let io_res = io::raise(&p, native)?;
+    let st = structure::structure(&p)?;
+    emit_with(&container, native, &p, &st, &io_res, &res, options)
+}
+
+/// `if (v0 < 32) { v1 = readfirstlane(v0); } store(v1)`: rejected in
+/// Wave32 by default (no barrier in divergent flow); with the experimental
+/// `readfirstlane_half` option it translates to the host half's own first
+/// lane (a ballot and a lane read, no barrier), and Emulate still refuses.
+#[test]
+fn divergent_readfirstlane_half_is_opt_in() {
+    let mut code = Vec::new();
+    code.push(v_mov_b32(1, inline_u(0)));
+    code.push(v_cmp_gt_u32(inline_u(32), 0)); // 32 > v0
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br_idx = code.len();
+    code.push(0);
+    code.push(v_readfirstlane_b32(4, 0));
+    code.push(v_mov_b32(1, 4));
+    let after_then = code.len();
+    code[br_idx] = s_cbranch_execz((after_then - (br_idx + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 1, 0);
+    code.push(S_ENDPGM);
+    let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+
+    let off = TranslateOptions {
+        wave64: Wave64Mode::Wave32,
+        ..Default::default()
+    };
+    assert!(matches!(
+        emit_cs_with(&prog, off),
+        Err(ShaderError::Unsupported { what, .. }) if what.contains("v_readfirstlane")
+    ));
+    let on = TranslateOptions {
+        wave64: Wave64Mode::Wave32,
+        readfirstlane_half: true,
+    };
+    let shader = emit_cs_with(&prog, on).expect("translates with the option");
+    assert_eq!(psv_wave_range(&shader), (32, 32));
+    let emulate = TranslateOptions {
+        wave64: Wave64Mode::Emulate,
+        readfirstlane_half: true,
+    };
+    assert!(matches!(
+        emit_cs_with(&prog, emulate),
+        Err(ShaderError::Unsupported { .. })
+    ));
 }
 
 #[test]
@@ -431,6 +489,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Native,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -439,6 +498,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Wave32,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -447,6 +507,7 @@ fn translate_with_handles_synthetic_wave64_container() {
         &dxbc,
         TranslateOptions {
             wave64: Wave64Mode::Emulate,
+            ..Default::default()
         },
     )
     .unwrap();

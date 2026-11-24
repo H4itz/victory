@@ -33,6 +33,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod memstat;
 pub mod list;
 pub mod object;
 pub mod pipeline;

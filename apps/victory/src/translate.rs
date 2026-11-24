@@ -393,6 +393,7 @@ fn translate(
                             .map_or(emit::Wave64Mode::Native, |(h, _)| {
                                 h.recommended_wave64_mode()
                             }),
+                        ..Default::default()
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {

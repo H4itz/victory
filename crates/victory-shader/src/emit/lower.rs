@@ -1359,6 +1359,11 @@ impl<'a> Lower<'a> {
     /// Emulates `v_readfirstlane_b32(val)` across all 64 lanes of a virtual wave.
     fn emulated_readfirstlane(&mut self, val: V, guard: Option<V>) -> Result<V, Why> {
         if self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false) {
+            if self.wave64 == Wave64Mode::Wave32 && self.x.options.readfirstlane_half {
+                // Experimental (see `readfirstlane_half`): the host half's
+                // first active lane, with no barrier.
+                return Ok(self.half_readfirstlane(val, guard));
+            }
             return Err("v_readfirstlane in divergent control flow");
         }
         let (_, console_lane, vwave) = self.ensure_wave_ids();
@@ -1455,6 +1460,29 @@ impl<'a> Lower<'a> {
         self.lds_barrier(self.cur);
         let pv = self.scratch_ptr(self.cur, base, stride, vwave, 1);
         Ok(self.s.m.load(self.cur, pv))
+    }
+
+    /// `v_readfirstlane_b32(val)` over the active lanes of the 32-lane host
+    /// wave only (lanes where `guard` holds, when there is one): legal in
+    /// divergent control flow, unlike the 64-lane exchange. With no lane
+    /// active (which cannot reach here) lane 0 is read.
+    fn half_readfirstlane(&mut self, val: V, guard: Option<V>) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let act = guard.unwrap_or_else(|| self.s.m.bool(true));
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
+        self.s.flags |= flags::WAVE_OPS;
+        let mask = self.s.m.extract(c, r, 0);
+        let k0 = self.s.m.i32(0);
+        let any = self.s.m.cmp(c, pred::NE, mask, k0);
+        let bit = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[mask]);
+        let lane = self.s.m.select(c, any, bit, k0);
+        self.read_lane(val, lane)
     }
 
     /// Pre-emits cross-block wave ballots while `self.cur` is at the end of `def_b` (`None` = entry).

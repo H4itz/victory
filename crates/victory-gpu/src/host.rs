@@ -643,10 +643,32 @@ impl Host {
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if crate::shadow::merge_copy_back() {
+            // Per host copy (in first-declaration order), each union of
+            // overlapping ranges once; then every declared range released.
+            let mut groups: Vec<(&std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
+            for (shadow, address, len) in &back {
+                let range = (*address, address + len);
+                match groups.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                    Some((_, ranges)) => ranges.push(range),
+                    None => groups.push((shadow, vec![range])),
+                }
+            }
+            for (shadow, ranges) in groups {
+                for (from, to) in crate::shadow::merge_ranges(ranges) {
+                    let written = shadow.sync_back(from, to - from);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                }
+            }
+            for (shadow, address, len) in &back {
+                shadow.release(*address, *len);
+            }
+        } else {
+            for (shadow, address, len) in &back {
+                let (address, len) = (*address, *len);
+                let written = shadow.copy_back(address, len);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -1823,7 +1845,8 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        let periodic = self.logged.elapsed() >= std::time::Duration::from_secs(5);
+        if periodic {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -1844,6 +1867,8 @@ impl Meter {
                 }
             }
         }
+        // After the frame-rate line; every second while commit runs low.
+        crate::memstat::tick(periodic);
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];
