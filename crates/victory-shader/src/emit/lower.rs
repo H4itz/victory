@@ -1004,6 +1004,9 @@ impl<'a> Lower<'a> {
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
+                // Experimental (`mesh_wave32`): 32-lane mesh programs on a
+                // host whose mesh waves are 32 lanes.
+                HwStage::Ms if x.options.mesh_wave32 && !x.native.wave64 => MaskData::Console,
                 _ => MaskData::None,
             },
             mask_ok: false,

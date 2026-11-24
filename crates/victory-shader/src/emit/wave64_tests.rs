@@ -361,12 +361,14 @@ fn divergent_readfirstlane_half_is_opt_in() {
     let on = TranslateOptions {
         wave64: Wave64Mode::Wave32,
         readfirstlane_half: true,
+        ..Default::default()
     };
     let shader = emit_cs_with(&prog, on).expect("translates with the option");
     assert_eq!(psv_wave_range(&shader), (32, 32));
     let emulate = TranslateOptions {
         wave64: Wave64Mode::Emulate,
         readfirstlane_half: true,
+        ..Default::default()
     };
     assert!(matches!(
         emit_cs_with(&prog, emulate),

@@ -145,6 +145,19 @@ pub fn readfirstlane_half() -> bool {
     })
 }
 
+/// Experimental, off unless `VICTORY_MESH_WAVE32=1`: the host runs mesh
+/// programs in 32-lane waves (NVIDIA GPUs always do; D3D12 cannot declare
+/// a mesh shader's wave size), so a console mesh program of 32-lane waves
+/// has its lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, wave
+/// reductions) as compute programs do: host lane n is console lane n. A
+/// 64-lane mesh program is still refused. On a host whose mesh waves are
+/// not 32 lanes the counts would be wrong. Part of the translation, so the
+/// shader cache keys on it.
+pub fn mesh_wave32() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_switch(std::env::var("VICTORY_MESH_WAVE32").ok().as_deref()))
+}
+
 /// An on/off environment switch: `1`, `on`, `true` or `yes` turn it on.
 /// Pure, for testing.
 fn parse_switch(value: Option<&str>) -> bool {
@@ -239,6 +252,8 @@ pub struct TranslateOptions {
     /// Experimental: see [`readfirstlane_half`] (the environment switch
     /// that `victory-gpu` passes here).
     pub readfirstlane_half: bool,
+    /// Experimental: see [`mesh_wave32`].
+    pub mesh_wave32: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console

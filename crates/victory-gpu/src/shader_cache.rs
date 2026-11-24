@@ -96,6 +96,10 @@ fn build() -> &'static [u8; 32] {
                 if half {
                     bytes.extend_from_slice(b"readfirstlane-half");
                 }
+                if victory_shader::emit::mesh_wave32() {
+                    tracing::warn!("VICTORY_MESH_WAVE32: 32-lane mesh programs read lane masks as compute does");
+                    bytes.extend_from_slice(b"mesh-wave32");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -117,6 +121,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let options = TranslateOptions {
         wave64,
         readfirstlane_half: victory_shader::emit::readfirstlane_half(),
+        mesh_wave32: victory_shader::emit::mesh_wave32(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
