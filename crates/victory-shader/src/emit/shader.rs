@@ -13,6 +13,21 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
+/// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
+/// reads buffers through descriptors it picks from the view heap at an
+/// index it computes (SM 6.6 dynamic resources): a raw buffer of
+/// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
+/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// The console's descriptor holds that stride and its hardware multiplies
+/// the element index by it; the program's code does not say it, and the
+/// used-resource list only names what tables hold. A shader that has this
+/// root SRV also tells the host that the buffer views of the whole heap
+/// must be ready when it runs, not only those its tables name.
+/// (Ported from the fxceless fork.)
+pub const SLOT_STRIDES: u8 = 255;
+/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;

@@ -175,6 +175,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Element strides read from the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
+    strides: HashMap<(usize, Site, u8), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -975,6 +978,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -3984,6 +3988,63 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A buffer the program picks from the view heap by an index it
+        // computes (`ResourceHeap`) has no used-resource entry, and the
+        // heap holds a buffer view there, not a constant buffer: read as
+        // raw bytes, as a table's SRV is below. Read as a constant buffer
+        // the loads gave nothing: Grand Theft Auto VI's meshlet culling
+        // reads its batch records, mesh headers and instance transforms
+        // this way, so it passed no meshlet and every indirect mesh draw
+        // ran empty. The host's table of strides by heap slot tells a
+        // buffer view (not 0) from anything else, which is still read as a
+        // constant buffer; only the load that fits the slot runs.
+        // (Ported from the fxceless fork.)
+        let picked = match kind {
+            None => self.slot_stride(src)?,
+            Some(_) => None,
+        };
+        if let Some(stride) = picked {
+            let zero = self.s.m.i32(0);
+            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let at = self.begin_guarded(Some(is_buffer));
+            let h = self.handle(site, src, false, (11, 0))?;
+            let mut raw = Vec::new();
+            for k in 0..count {
+                let b = self.cur;
+                let off = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(b, Bin::Add, addr, off);
+                let mask = self.s.m.i8(1);
+                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let r = self.s.op(
+                    b,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, a, u, mask, al],
+                );
+                let x = self.s.m.extract(b, r, 0);
+                let x = self.as_int(x);
+                raw.push((x, zero));
+            }
+            let raw = self.end_guarded(at, &raw);
+            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let at = self.begin_guarded(Some(other));
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let mut both = Vec::new();
+            for (k, &r) in raw.iter().enumerate() {
+                let b = self.cur;
+                let off = self.s.m.i32(4 * k as u32);
+                let a = self.s.m.bin(b, Bin::Add, addr, off);
+                let x = self.cbuffer_dword(h, a);
+                both.push((x, r));
+            }
+            let both = self.end_guarded(at, &both);
+            for (k, x) in both.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
@@ -4651,6 +4712,53 @@ impl<'a> Lower<'a> {
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
+    /// The bytes per element of the buffer view `src` names, if the program
+    /// picks it from the view heap at an index it computes (root type
+    /// `ResourceHeap`): read from the host's table by heap slot in the
+    /// current block. (Ported from the fxceless fork.)
+    fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let Source::Loaded { load, first } = src else {
+            return Ok(None);
+        };
+        let heap = self
+            .scalar
+            .get(load)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        if !heap {
+            return Ok(None);
+        }
+        let key = (self.cur, *load, *first);
+        if let Some(&v) = self.strides.get(&key) {
+            return Ok(Some(v));
+        }
+        let c = self.cur;
+        let slot = self.heap_index(*load, *first, false)?;
+        // Inside the table whatever the index (lanes that do not run
+        // compute one too): a root view has no bounds of its own.
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        let v = self.as_int(f);
+        self.strides.insert(key, v);
+        Ok(Some(v))
+    }
+
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar
@@ -7459,6 +7567,20 @@ impl<'a> Lower<'a> {
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+        }
+        // A buffer the program picks from the view heap by an index it
+        // computes: no used-resource entry gives its stride, the host's
+        // table by heap slot does; the access becomes a raw one at the
+        // element's byte. (Ported from the fxceless fork.)
+        let mut index = index;
+        if let Some(stride) = self.slot_stride(src)?
+            && let Some(element) = index
+            && !typed
+            && used.is_none()
+        {
+            let at = self.s.m.bin(c, Bin::Mul, element, stride);
+            off = self.s.m.bin(c, Bin::Add, at, off);
+            index = None;
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).

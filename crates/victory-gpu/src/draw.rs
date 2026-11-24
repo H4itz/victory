@@ -582,6 +582,23 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == victory_shader::emit::SLOT_STRIDES {
+                        // Ours, not the title's: the shader picks buffers
+                        // from the view heap by an index it computes.
+                        match self.heap_buffers(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap, which the list keeps.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader picks buffers from a view heap that is not set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -815,6 +832,70 @@ impl State {
                 crate::producers::dropped_target(&writer, t);
             }
         }
+    }
+
+    /// For shaders that pick buffers from the bound view heap by an index
+    /// they compute (`victory_shader::emit::SLOT_STRIDES`): the GPU address
+    /// of the heap's table of element strides by slot. Once per frame the
+    /// heap's buffer views are made and their memory brought up to date
+    /// (tables only make and refresh the views they name).
+    /// (Ported from the fxceless fork.)
+    // shortcut: what the title writes into such buffers between lists of
+    // one frame is seen a frame late; writes through such views are not
+    // copied back.
+    fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let (buffer, gpu) = host.strides()?;
+        // One key per list, as textures have: no title resource is there.
+        const ONCE: usize = usize::MAX - 0x5e;
+        if !list.first_use(ONCE) {
+            return Some(gpu);
+        }
+        list.keep(buffer);
+        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        let frame = crate::frame::current();
+        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+            return Some(gpu);
+        }
+        let started = std::time::Instant::now();
+        let slots = host.buffer_slots();
+        let (mut views, mut bytes) = (0u32, 0u64);
+        for &index in &slots {
+            let Some(handle) = heap.handle(index) else {
+                continue;
+            };
+            let Some(view) = host.mirror(index, handle, true) else {
+                continue;
+            };
+            if let Some((address, len)) = crate::descriptor::host::buffer_range(&view)
+                && len > 0
+                && let Some(shadow) = crate::shadow::find(address, len)
+            {
+                shadow.refresh(list, address, len);
+                views += 1;
+                bytes += len;
+            }
+        }
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        // The first pass and every growth of the set by half.
+        let seen = LOGGED.load(Ordering::Relaxed);
+        if u64::from(views) > seen + seen / 2 {
+            LOGGED.store(u64::from(views), Ordering::Relaxed);
+            tracing::info!(
+                slots = slots.len(),
+                views,
+                mb = bytes >> 20,
+                ms = started.elapsed().as_millis(),
+                "buffer views of the heap made ready for shaders that pick them by index"
+            );
+        }
+        Some(gpu)
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {

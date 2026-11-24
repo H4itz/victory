@@ -381,7 +381,10 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                    // Ours, not the title's, stays a root descriptor: the
+                    // table of element strides by heap slot.
+                    let ours = slot == victory_shader::emit::SLOT_STRIDES;
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the reads,
                         // which a root descriptor leaves unbounded.
                         ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {

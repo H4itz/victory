@@ -34,6 +34,15 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// View heaps: the bytes per element of the buffer view at each title
+    /// slot, for shaders that pick a buffer by an index they compute
+    /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
+    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// (Ported from the fxceless fork.)
+    strides: Option<(ID3D12Resource, u64, usize)>,
+    /// Title slots holding buffer views, made and refreshed for such
+    /// shaders by [`crate::draw`]'s heap pass.
+    buffers: Mutex<std::collections::BTreeSet<u32>>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -169,6 +178,18 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let strides = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -179,6 +200,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra + guard) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            strides,
+            buffers: Mutex::new(std::collections::BTreeSet::new()),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -422,6 +445,50 @@ impl HostHeap {
         }
     }
 
+    /// Notes the element stride of the buffer view at title slot `index`
+    /// (none: not a buffer view) in the stride table and the set of buffer
+    /// slots.
+    fn note_stride(&self, index: u32, stride: Option<u32>) {
+        let Some((_, _, data)) = &self.strides else {
+            return;
+        };
+        if index >= victory_shader::emit::SLOT_STRIDES_COUNT {
+            return;
+        }
+        // SAFETY: inside the mapping; shaders read it while we write (a
+        // dword, either value is one the slot had).
+        let at = unsafe { (*data as *mut u32).add(index as usize) };
+        // SAFETY: as above.
+        let was = unsafe { at.read_volatile() };
+        let now = stride.unwrap_or(0);
+        if was == now {
+            return;
+        }
+        // SAFETY: as above.
+        unsafe { at.write_volatile(now) };
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if now != 0 {
+            buffers.insert(index);
+        } else {
+            buffers.remove(&index);
+        }
+    }
+
+    /// The stride table's GPU address and buffer (view heaps).
+    pub(crate) fn strides(&self) -> Option<(&ID3D12Resource, u64)> {
+        self.strides.as_ref().map(|(b, gpu, _)| (b, *gpu))
+    }
+
+    /// Title slots holding buffer views.
+    pub(crate) fn buffer_slots(&self) -> Vec<u32> {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect()
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -450,6 +517,7 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            self.note_stride(index, None);
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
@@ -457,6 +525,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            self.note_stride(index, view_stride(&view));
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -535,6 +604,41 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     }
+}
+
+/// Bytes per element of a buffer view, as the console's descriptor holds
+/// them for indexed reads (structured: the stride; raw: 1, the index is the
+/// byte; typed: the format's); `None` if `view` is not a buffer view.
+/// (Ported from the fxceless fork.)
+fn view_stride(view: &View) -> Option<u32> {
+    const BUFFER: u32 = 1;
+    let (words, unordered): (&[u32; 10], bool) = match view {
+        View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+            (d[..10].try_into().ok()?, *unordered)
+        }
+        _ => return None,
+    };
+    // SAFETY: buffer views' union members.
+    let (stride, raw, format) = unsafe {
+        if unordered {
+            let d = uav_desc(words);
+            let b = d.Anonymous.Buffer;
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format)
+        } else {
+            let d = srv_desc(words);
+            let b = d.Anonymous.Buffer;
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
+        }
+    };
+    Some(if stride > 0 {
+        stride
+    } else if raw {
+        1
+    } else {
+        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
+    })
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
