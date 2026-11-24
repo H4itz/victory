@@ -1992,6 +1992,95 @@ impl Host {
         }
     }
 
+    /// Show mode with `VICTORY_COMPOSE_UI` (diagnostics builds): `layers`
+    /// (texture, host state) drawn over one another into a back buffer as
+    /// big as the largest, the first opaque ([`crate::compose`]). `None` if
+    /// composition is not available or no layer could be drawn (the
+    /// caller presents the usual way).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn present_layers(
+        &self,
+        layers: &[(&ID3D12Resource, u32)],
+        straight: bool,
+        frame: u64,
+    ) -> Option<bool> {
+        let compose = crate::compose::get(&self.device)?;
+        let (width, height) = layers
+            .iter()
+            .map(|(t, _)| {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                (d.Width as u32, d.Height)
+            })
+            .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))?;
+        let format = crate::compose::FORMAT;
+        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        if presenter.is_none() {
+            *presenter = match self.presenter(width, height, format) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no swap chain");
+                    return None;
+                }
+            };
+        }
+        let p = presenter.as_mut()?;
+        if (p.width, p.height, p.format) != (width, height, format) {
+            // SAFETY: no back buffer is held; every submission was waited for.
+            let resized = unsafe {
+                p.swap_chain
+                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            };
+            match resized {
+                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Err(e) => {
+                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    return None;
+                }
+            }
+        }
+        let drawn: Vec<crate::compose::Layer<'_>> = layers
+            .iter()
+            .map(|&(texture, state)| crate::compose::Layer {
+                texture,
+                state: D3D12_RESOURCE_STATES(legal_state(texture, state) as i32),
+            })
+            .collect();
+        // SAFETY: our swap chain and list; live layer textures.
+        unsafe {
+            let index = p.swap_chain.GetCurrentBackBufferIndex();
+            let back = p.swap_chain.GetBuffer::<ID3D12Resource>(index).ok()?;
+            p.copy.reset();
+            if !compose.record(&self.device, &p.copy.list, &back, (width, height), &drawn, straight) {
+                p.copy.close();
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            let capture = crate::capture::wanted(frame).then(|| {
+                p.copy.list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let read = crate::capture::read_back(&self.device, &p.copy.list, &back);
+                p.copy.list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+                read
+            });
+            p.copy.close();
+            self.execute(&[&p.copy]);
+            if let Some(Some((buffer, footprint))) = capture {
+                crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            p.meter.frame(p.hwnd);
+        }
+        Some(false)
+    }
+
     fn presenter(
         &self,
         width: u32,

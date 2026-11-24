@@ -316,7 +316,10 @@ impl State {
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            {
+                crate::capture::note_slot(record.resource, rtvs.len());
+                crate::capture::note_target(record.resource);
+            }
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;

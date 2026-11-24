@@ -246,6 +246,9 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_SHOW_TARGET=busiest:<slot>` limits `busiest` to layers bound
+/// at that render target slot.
+///
 /// `VICTORY_SHOW_TARGET=<n>`: every frame shows the `n`th texture it
 /// rendered to or wrote (first-use order, the `<i>` of a target dump's file
 /// names) instead of what the title presents; frames with fewer targets show
@@ -257,7 +260,10 @@ fn dump_on() -> bool {
 #[derive(Clone, Copy)]
 pub(crate) enum Show {
     Index(usize),
-    Busiest,
+    /// The busiest layer; with a slot, only layers bound at that render
+    /// target slot (`busiest:0` is where G-buffers usually keep base
+    /// colour). Ties go to the lowest slot.
+    Busiest(Option<u8>),
 }
 
 pub(crate) fn show_index() -> Option<Show> {
@@ -265,8 +271,11 @@ pub(crate) fn show_index() -> Option<Show> {
     *N.get_or_init(|| {
         let v = std::env::var("VICTORY_SHOW_TARGET").ok()?;
         let v = v.trim();
-        let show = if v.eq_ignore_ascii_case("busiest") {
-            Show::Busiest
+        let lower = v.to_ascii_lowercase();
+        let show = if lower == "busiest" {
+            Show::Busiest(None)
+        } else if let Some(slot) = lower.strip_prefix("busiest:") {
+            Show::Busiest(Some(slot.trim().parse().ok()?))
         } else {
             Show::Index(v.parse().ok()?)
         };
@@ -284,7 +293,7 @@ static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::ne
 
 /// At the present of `frame` in show mode: the noted target to show, if the
 /// frame has one. Clears the frame's list unless a dump still needs it.
-pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+pub(crate) fn shown(frame: u64) -> Option<Shown> {
     let show = show_index()?;
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
@@ -301,9 +310,12 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
             .collect();
         tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
     }
+    let slots = std::mem::take(&mut *SLOTS.lock().unwrap_or_else(|e| e.into_inner()));
+    let slot_of = |r: usize| slots.iter().find(|s| s.0 == r).map(|s| s.1);
+    let overlay = compose_ui().then(|| overlay_of(&targets, &hits)).flatten();
     let pick = match show {
         Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
-        Show::Busiest => {
+        Show::Busiest(slot) => {
             let draws = |r: usize| hits.iter().find(|h| h.0 == r).map_or(0, |h| h.1);
             let candidates: Vec<&(usize, std::sync::Arc<crate::resource::HostTexture>)> = targets
                 .iter()
@@ -315,8 +327,15 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
                         && d.Width * 9 == u64::from(d.Height) * 16
                         && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
                 })
+                // Not the UI layer drawn over it, nor another slot's.
+                .filter(|(r, _)| overlay.as_ref().is_none_or(|(o, _)| o != r))
+                .filter(|(r, _)| slot.is_none_or(|want| slot_of(*r) == Some(want)))
                 .collect();
-            let busiest = candidates.iter().max_by_key(|(r, _)| draws(*r));
+            // Most draws; among layers drawn together (a G-buffer's), the
+            // lowest slot.
+            let busiest = candidates
+                .iter()
+                .max_by_key(|(r, _)| (draws(*r), std::cmp::Reverse(slot_of(*r).unwrap_or(u8::MAX))));
             let mut last = LAST_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
             // Keep the layer shown last while it has at least half the
             // busiest one's draws: switching layers frame to frame flickers.
@@ -342,7 +361,96 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
         targets.clear();
     }
     hits.clear();
-    pick
+    let overlay = match overlay {
+        Some((r, c)) => {
+            *LAST_OVERLAY.lock().unwrap_or_else(|e| e.into_inner()) = Some((r, c.clone()));
+            Some(c)
+        }
+        None if compose_ui() => LAST_OVERLAY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, c)| c.clone()),
+        None => None,
+    };
+    (pick.is_some() || overlay.is_some()).then_some(Shown { base: pick, overlay })
+}
+
+/// What show mode presents: a layer, and with `VICTORY_COMPOSE_UI` the UI
+/// layer blended over it.
+pub(crate) struct Shown {
+    pub(crate) base: Option<std::sync::Arc<crate::resource::HostTexture>>,
+    pub(crate) overlay: Option<std::sync::Arc<crate::resource::HostTexture>>,
+}
+
+/// `VICTORY_COMPOSE_UI=1` (with `VICTORY_SHOW_TARGET`): the title's UI
+/// layer is blended over the layer shown. The console shows several
+/// planes at once (the game's picture and a UI plane, which on the Series
+/// S path is 3840x2160 while the game renders at 1280x720); we present
+/// one. shortcut: the UI layer is found by shape, not from the present's
+/// plane list (its layout past the first plane is not known yet): the
+/// largest 8-bit colour target of the frame, 16:9 and at least 2560 wide;
+/// it is taken as premultiplied (`VICTORY_COMPOSE_UI=straight` for
+/// straight alpha).
+pub(crate) fn compose_ui() -> bool {
+    compose_mode().is_some()
+}
+
+/// `Some(straight alpha)` when composing.
+pub(crate) fn compose_mode() -> Option<bool> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let v = std::env::var("VICTORY_COMPOSE_UI").ok()?;
+        let v = v.trim().to_ascii_lowercase();
+        let mode = match v.as_str() {
+            "1" | "on" | "true" | "yes" | "premultiplied" => false,
+            "straight" => true,
+            _ => return None,
+        };
+        tracing::warn!(straight = mode, "VICTORY_COMPOSE_UI: the UI layer is drawn over the layer shown");
+        Some(mode)
+    })
+}
+
+/// The frame's UI layer (see [`compose_ui`]).
+fn overlay_of(
+    targets: &[(usize, std::sync::Arc<crate::resource::HostTexture>)],
+    hits: &[(usize, u32)],
+) -> Option<(usize, std::sync::Arc<crate::resource::HostTexture>)> {
+    targets
+        .iter()
+        .filter(|(r, _)| hits.iter().any(|h| h.0 == *r && h.1 > 0))
+        .filter_map(|(r, c)| {
+            // SAFETY: a live resource.
+            let d = unsafe { c.texture.GetDesc() };
+            (d.Width >= 2560
+                && d.Width * 9 == u64::from(d.Height) * 16
+                && d.SampleDesc.Count == 1
+                && matches!(d.Format.0, 27..=29 | 87 | 90 | 91))
+                .then_some((d.Width * u64::from(d.Height), (*r, c.clone())))
+        })
+        .max_by_key(|(area, _)| *area)
+        .map(|(_, t)| t)
+}
+
+/// The UI layer composed last, kept for frames that draw none.
+static LAST_OVERLAY: std::sync::Mutex<Option<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(None);
+
+/// Per render target this frame: the lowest slot it was bound at.
+static SLOTS: std::sync::Mutex<Vec<(usize, u8)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes the render target slot `resource` is bound at (show mode).
+pub(crate) fn note_slot(resource: crate::object::This, slot: usize) {
+    if resource.is_null() || show_index().is_none() {
+        return;
+    }
+    let slot = slot.min(u8::MAX as usize) as u8;
+    let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    match slots.iter_mut().find(|s| s.0 == resource as usize) {
+        Some(s) => s.1 = s.1.min(slot),
+        None => slots.push((resource as usize, slot)),
+    }
 }
 
 /// Notes a title texture the frame being built renders to or writes.

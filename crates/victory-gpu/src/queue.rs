@@ -305,10 +305,25 @@ extern "system" fn present(
         crate::capture::dump_targets(frame);
     }
     #[cfg(all(windows, feature = "diagnostics"))]
-    if let (Some(copy), Some(host)) = (&shown, crate::host::host()) {
-        let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
-        if host.present(&copy.texture, state, frame).is_some() {
-            return S_OK;
+    if let (Some(shown), Some(host)) = (&shown, crate::host::host()) {
+        // With `VICTORY_COMPOSE_UI`: the layer, then the UI layer over it.
+        if let (Some(straight), Some(overlay)) = (crate::capture::compose_mode(), &shown.overlay) {
+            let mut layers = Vec::with_capacity(2);
+            if let Some(base) = &shown.base
+                && !std::sync::Arc::ptr_eq(base, overlay)
+            {
+                layers.push((&base.texture, base.state.load(Ordering::Relaxed)));
+            }
+            layers.push((&overlay.texture, overlay.state.load(Ordering::Relaxed)));
+            if host.present_layers(&layers, straight, frame).is_some() {
+                return S_OK;
+            }
+        }
+        if let Some(copy) = &shown.base {
+            let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+            if host.present(&copy.texture, state, frame).is_some() {
+                return S_OK;
+            }
         }
     }
     #[cfg(windows)]
