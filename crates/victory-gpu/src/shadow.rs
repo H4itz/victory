@@ -519,6 +519,20 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// The title buffer that covers `address..address + len`, if any: whether
+/// it already has a host copy (`Some(true)`), or would get one from
+/// [`find`] (`Some(false)`). Never makes a copy, and memory outside title
+/// buffers (which [`find`] gives a loose window) is `None`.
+pub(crate) fn covered(address: u64, len: u64) -> Option<bool> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(_, e)| e.shadow.is_some())
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {

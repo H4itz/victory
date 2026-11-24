@@ -865,18 +865,46 @@ impl State {
         }
         let started = std::time::Instant::now();
         let slots = host.buffer_slots();
-        let (mut views, mut bytes) = (0u32, 0u64);
+        // Bounded: one pass over the world's heap made 55,000 views over
+        // 4.5 GB of title memory (2.3 GB of it loose windows) and took a
+        // 16 GB machine out of commit (Series S run, 2026-11-25). Memory
+        // outside title buffers is left out; new host copies stop at
+        // NEW_COPIES a pass (the rest come in later frames), and at none
+        // while free commit is low (existing ones are still refreshed).
+        // shortcut: buffers in loose title memory read nothing through a
+        // heap-picked view.
+        const NEW_COPIES: u64 = 256 << 20;
+        const LOW_COMMIT: u64 = 2 << 30;
+        let mut budget = match crate::memstat::free_commit() {
+            Some(free) if free < LOW_COMMIT => 0,
+            _ => NEW_COPIES,
+        };
+        let (mut views, mut bytes, mut skipped) = (0u32, 0u64, 0u32);
         for &index in &slots {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some(view) = crate::descriptor::view(handle) else {
                 continue;
             };
-            if let Some((address, len)) = crate::descriptor::host::buffer_range(&view)
-                && len > 0
-                && let Some(shadow) = crate::shadow::find(address, len)
-            {
+            let Some((address, len)) = crate::descriptor::host::buffer_range(&view) else {
+                continue;
+            };
+            if len == 0 {
+                continue;
+            }
+            match crate::shadow::covered(address, len) {
+                Some(true) => {}
+                Some(false) if len <= budget => budget -= len,
+                _ => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            if host.mirror(index, handle, true).is_none() {
+                continue;
+            }
+            if let Some(shadow) = crate::shadow::find(address, len) {
                 shadow.refresh(list, address, len);
                 views += 1;
                 bytes += len;
@@ -890,6 +918,7 @@ impl State {
             tracing::info!(
                 slots = slots.len(),
                 views,
+                skipped,
                 mb = bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
