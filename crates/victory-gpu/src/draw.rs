@@ -547,9 +547,24 @@ impl State {
                 }
                 return false;
             }
+            // Title memory by address: what the shader finds it by
+            // ([`crate::memory`]). (From the fxceless fork.)
+            let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                let Some(ready) = self.memory_ready(list, compute) else {
+                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                    return false;
+                };
+                Some(ready)
+            } else {
+                None
+            };
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if u.root == RootType::Other(victory_shader::emit::USER_MEMORY_BASE) {
+                        values[u.index as usize] = memory.as_ref().map_or(0, |m| m.base);
+                        continue;
+                    }
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
@@ -581,6 +596,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_FAULTS {
+                    // Ours: where shaders note the pages they found empty.
+                    if let Some(m) = &memory {
+                        // SAFETY: an open list; the buffer lives as long as
+                        // the process and the list holds it.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, m.faults);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // A root UAV: the title buffer's host copy from the address
                 // on, brought up to date before the list runs and copied
                 // back into title memory after it (what the shader stored).
@@ -616,6 +646,21 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == victory_shader::emit::SLOT_MEMORY {
+                        // Ours: the directory of title memory by address.
+                        if let Some(m) = &memory {
+                            // SAFETY: an open list; the directory lives as
+                            // long as the process and the list holds it.
+                            unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, m.directory);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -866,6 +911,26 @@ impl State {
                 crate::producers::dropped_target(&writer, t);
             }
         }
+    }
+
+    /// For a shader that reads title memory by address
+    /// ([`crate::memory`]): its directory, fault notes and view slots,
+    /// with the pages of the root views and constants the list has set
+    /// made ready. (From the fxceless fork.)
+    fn memory_ready(&self, list: &HostList, compute: bool) -> Option<crate::memory::Ready> {
+        let heap = match self.heaps[0] {
+            0 => None,
+            h => crate::descriptor::heap(h as This).host(),
+        }?;
+        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        for root in self.roots_ref(compute) {
+            match root {
+                Root::View(address) => addresses.push(*address),
+                Root::Constants(values) => constants.extend_from_slice(values),
+                _ => {}
+            }
+        }
+        crate::memory::ready(list, heap, &addresses, &constants, true)
     }
 
     /// For shaders that pick buffers from the bound view heap by an index

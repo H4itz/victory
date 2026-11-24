@@ -37,6 +37,23 @@ pub struct Address {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// [`Address::param`] of title memory at an address no root parameter
+/// gives: one the code computes from root constants, reads out of a
+/// descriptor or loads from other memory (compute programs only). Offset
+/// and computed term are not used: lowering takes the 64-bit address from
+/// the instruction's operands. (From the fxceless fork.)
+pub const MEMORY: usize = usize::MAX - 1;
+
+/// The reasons an address traces to no root parameter for which the
+/// address is then taken as it stands ([`MEMORY`]).
+const RAW: [&str; 5] = [
+    "an address not from a root parameter",
+    "an address from a root parameter that is no address",
+    "an address in an SGPR that is no root parameter",
+    "an address loaded from memory",
+    "an address from a phi",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -176,7 +193,10 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = t
+                        .smem_address(inst, base, *offset, soffset)
+                        .or_else(|why| t.by_address(why))
+                        .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -187,6 +207,7 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                 } if inst.name().starts_with("global_") => {
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .or_else(|why| t.by_address(why))
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -508,6 +529,21 @@ impl<'a> Tracer<'a> {
             return t;
         }
         self.origin(v)
+    }
+
+    /// The address of an access that traces to no root parameter (`why`
+    /// says how it failed): title memory at the address as it stands, in a
+    /// compute program.
+    fn by_address(&self, why: &'static str) -> Result<Address, &'static str> {
+        if self.stage == HwStage::Cs && RAW.contains(&why) {
+            Ok(Address {
+                param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            })
+        } else {
+            Err(why)
+        }
     }
 
     /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR

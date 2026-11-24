@@ -37,6 +37,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod memstat;
+#[cfg(windows)]
+mod memory;
 pub mod list;
 pub mod object;
 pub mod pipeline;

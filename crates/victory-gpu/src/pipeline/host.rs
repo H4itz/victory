@@ -394,7 +394,8 @@ impl HostPipeline {
                 for &slot in slots {
                     // Ours, not the title's, stays a root descriptor: the
                     // table of element strides by heap slot.
-                    let ours = slot == victory_shader::emit::SLOT_STRIDES;
+                    let ours = slot == victory_shader::emit::SLOT_STRIDES
+                        || slot == victory_shader::emit::SLOT_MEMORY;
                     if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the reads,
                         // which a root descriptor leaves unbounded.
