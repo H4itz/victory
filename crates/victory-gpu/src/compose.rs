@@ -14,9 +14,10 @@ use windows::core::PCSTR;
 use crate::host::transition;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
-cbuffer Layer : register(b0) { uint opaque; uint straight; };
+#define RS "RootConstants(num32BitConstants=3, b0), DescriptorTable(SRV(t0, numDescriptors=2)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
+cbuffer Layer : register(b0) { uint opaque; uint straight; uint shade; };
 Texture2D<float4> layer : register(t0);
+Texture2D<float4> normals : register(t1);
 SamplerState linear_clamp : register(s0);
 struct V { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
@@ -29,6 +30,19 @@ V vs(uint id : SV_VertexID) {
 [RootSignature(RS)]
 float4 ps(V i) : SV_Target {
     float4 c = saturate(layer.Sample(linear_clamp, i.uv));
+    if (shade != 0) {
+        // Simple light in place of the title's: sky from above, a sun,
+        // from the G-buffer's normals (stored as 0..1 per axis).
+        float3 n = normals.Sample(linear_clamp, i.uv).xyz * 2 - 1;
+        float len = length(n);
+        if (len > 0.05) {
+            n /= len;
+            float3 sun = normalize(float3(0.35, 0.45, 0.82));
+            float up = max(n.z, n.y);
+            float light = 0.35 + 0.35 * saturate(0.5 + 0.5 * up) + 0.65 * saturate(dot(n, sun));
+            c.rgb *= light;
+        }
+    }
     if (opaque != 0) { c.a = 1; }
     else if (straight != 0) { c.rgb *= c.a; }
     return c;
@@ -37,6 +51,8 @@ float4 ps(V i) : SV_Target {
 
 /// Layers drawn at most per present.
 const LAYERS: u32 = 2;
+/// Views per layer: the layer, and the normals it is lit with (or null).
+const VIEWS: u32 = 2;
 
 pub(crate) struct Compose {
     root: ID3D12RootSignature,
@@ -156,7 +172,7 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Compose> {
         let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
         let srvs: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: LAYERS,
+            NumDescriptors: LAYERS * VIEWS,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })?;
@@ -183,10 +199,40 @@ fn view_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-/// A layer to draw: its texture and the state it is in (it is left there).
+/// A layer to draw: its texture and the state it is in (it is left there),
+/// and for the first layer optionally the G-buffer normals to light it
+/// with (`VICTORY_LIT`).
 pub(crate) struct Layer<'a> {
     pub(crate) texture: &'a ID3D12Resource,
     pub(crate) state: D3D12_RESOURCE_STATES,
+    pub(crate) normals: Option<(&'a ID3D12Resource, D3D12_RESOURCE_STATES)>,
+}
+
+/// A 2D texture's typed sampling format, if composition can sample it.
+fn sampled(texture: &ID3D12Resource) -> Option<DXGI_FORMAT> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let plain = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.SampleDesc.Count == 1
+        && d.DepthOrArraySize == 1
+        && d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0;
+    plain.then(|| view_format(d.Format)).flatten()
+}
+
+fn srv(format: DXGI_FORMAT) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            },
+        },
+    }
 }
 
 impl Compose {
@@ -205,16 +251,13 @@ impl Compose {
         let usable: Vec<(&Layer<'_>, DXGI_FORMAT)> = layers
             .iter()
             .take(LAYERS as usize)
-            .filter_map(|l| {
-                // SAFETY: a live resource.
-                let d = unsafe { l.texture.GetDesc() };
-                let plain = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-                    && d.SampleDesc.Count == 1
-                    && d.DepthOrArraySize == 1
-                    && d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0;
-                plain.then(|| view_format(d.Format)).flatten().map(|f| (l, f))
-            })
+            .filter_map(|l| sampled(l.texture).map(|f| (l, f)))
             .collect();
+        // Normals the first layer is lit with, if it can be sampled.
+        let lit: Option<(&ID3D12Resource, D3D12_RESOURCE_STATES, DXGI_FORMAT)> = usable
+            .first()
+            .and_then(|(l, _)| l.normals)
+            .and_then(|(t, s)| sampled(t).map(|f| (t, s, f)));
         if usable.is_empty() {
             return false;
         }
@@ -224,32 +267,37 @@ impl Compose {
         unsafe {
             let srv_cpu = self.srvs.GetCPUDescriptorHandleForHeapStart();
             let srv_gpu = self.srvs.GetGPUDescriptorHandleForHeapStart();
+            let at = |k: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: srv_cpu.ptr + k * self.srv_step as usize,
+            };
             for (i, (layer, format)) in usable.iter().enumerate() {
-                let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: *format,
-                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_SRV {
-                            MostDetailedMip: 0,
-                            MipLevels: 1,
-                            PlaneSlice: 0,
-                            ResourceMinLODClamp: 0.0,
-                        },
-                    },
-                };
-                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
-                    ptr: srv_cpu.ptr + i * self.srv_step as usize,
-                };
-                device.CreateShaderResourceView(layer.texture, Some(&view), at);
+                let k = i * VIEWS as usize;
+                device.CreateShaderResourceView(layer.texture, Some(&srv(*format)), at(k));
+                match lit.filter(|_| i == 0) {
+                    Some((normals, _, f)) => device.CreateShaderResourceView(normals, Some(&srv(f)), at(k + 1)),
+                    // A null view: reads zeros.
+                    None => device.CreateShaderResourceView(
+                        None::<&ID3D12Resource>,
+                        Some(&srv(DXGI_FORMAT_R8G8B8A8_UNORM)),
+                        at(k + 1),
+                    ),
+                }
             }
             let rtv = self.rtv.GetCPUDescriptorHandleForHeapStart();
             device.CreateRenderTargetView(back, None, rtv);
-            let mut before: Vec<D3D12_RESOURCE_BARRIER> = usable
+            // Each texture once, from the state it is in.
+            let mut read_states: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES)> = Vec::new();
+            for (t, st) in usable
                 .iter()
-                .filter(|(l, _)| l.state != read)
-                .map(|(l, _)| transition(l.texture, l.state, read))
-                .collect();
+                .map(|(l, _)| (l.texture, l.state))
+                .chain(lit.map(|(t, st, _)| (t, st)))
+            {
+                if st != read && !read_states.iter().any(|(x, _)| *x == t) {
+                    read_states.push((t, st));
+                }
+            }
+            let mut before: Vec<D3D12_RESOURCE_BARRIER> =
+                read_states.iter().map(|(t, st)| transition(t, *st, read)).collect();
             before.push(transition(
                 back,
                 D3D12_RESOURCE_STATE_PRESENT,
@@ -277,21 +325,18 @@ impl Compose {
             list.SetPipelineState(&self.pso);
             list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             for i in 0..usable.len() {
-                let constants = [u32::from(i == 0), u32::from(straight)];
-                list.SetGraphicsRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                let constants = [u32::from(i == 0), u32::from(straight), u32::from(i == 0 && lit.is_some())];
+                list.SetGraphicsRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
                 list.SetGraphicsRootDescriptorTable(
                     1,
                     D3D12_GPU_DESCRIPTOR_HANDLE {
-                        ptr: srv_gpu.ptr + (i as u64) * u64::from(self.srv_step),
+                        ptr: srv_gpu.ptr + (i as u64) * u64::from(VIEWS * self.srv_step),
                     },
                 );
                 list.DrawInstanced(3, 1, 0, 0);
             }
-            let mut after: Vec<D3D12_RESOURCE_BARRIER> = usable
-                .iter()
-                .filter(|(l, _)| l.state != read)
-                .map(|(l, _)| transition(l.texture, read, l.state))
-                .collect();
+            let mut after: Vec<D3D12_RESOURCE_BARRIER> =
+                read_states.iter().map(|(t, st)| transition(t, read, *st)).collect();
             after.push(transition(
                 back,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,

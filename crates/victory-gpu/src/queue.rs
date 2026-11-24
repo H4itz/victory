@@ -315,7 +315,21 @@ extern "system" fn present(
                 layers.push((&base.texture, base.state.load(Ordering::Relaxed)));
             }
             layers.push((&overlay.texture, overlay.state.load(Ordering::Relaxed)));
-            if host.present_layers(&layers, straight, frame).is_some() {
+            // Lit (`VICTORY_LIT`) only when the base is drawn first.
+            let normals = shown
+                .normals
+                .as_ref()
+                .filter(|_| layers.len() == 2)
+                .map(|n| (&n.texture, n.state.load(Ordering::Relaxed)));
+            if host.present_layers(&layers, normals, straight, frame).is_some() {
+                return S_OK;
+            }
+        }
+        // Lit without a UI layer to draw over it.
+        if let (Some(base), Some(n)) = (&shown.base, &shown.normals) {
+            let layers = [(&base.texture, base.state.load(Ordering::Relaxed))];
+            let normals = Some((&n.texture, n.state.load(Ordering::Relaxed)));
+            if host.present_layers(&layers, normals, false, frame).is_some() {
                 return S_OK;
             }
         }

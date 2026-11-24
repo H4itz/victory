@@ -2001,6 +2001,7 @@ impl Host {
     pub(crate) fn present_layers(
         &self,
         layers: &[(&ID3D12Resource, u32)],
+        normals: Option<(&ID3D12Resource, u32)>,
         straight: bool,
         frame: u64,
     ) -> Option<bool> {
@@ -2041,9 +2042,13 @@ impl Host {
         }
         let drawn: Vec<crate::compose::Layer<'_>> = layers
             .iter()
-            .map(|&(texture, state)| crate::compose::Layer {
+            .enumerate()
+            .map(|(i, &(texture, state))| crate::compose::Layer {
                 texture,
                 state: D3D12_RESOURCE_STATES(legal_state(texture, state) as i32),
+                normals: normals.filter(|_| i == 0).map(|(t, st)| {
+                    (t, D3D12_RESOURCE_STATES(legal_state(t, st) as i32))
+                }),
             })
             .collect();
         // SAFETY: our swap chain and list; live layer textures.

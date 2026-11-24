@@ -357,6 +357,37 @@ pub(crate) fn shown(frame: u64) -> Option<Shown> {
             }
         }
     };
+    // The normals written beside the layer shown: slot 0, its size.
+    let normals = match (&pick, lit()) {
+        (Some(base), true) => {
+            // SAFETY: a live resource.
+            let bd = unsafe { base.texture.GetDesc() };
+            let same = |c: &std::sync::Arc<crate::resource::HostTexture>| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                d.Width == bd.Width && d.Height == bd.Height
+            };
+            let found = targets
+                .iter()
+                .filter(|(r, c)| {
+                    slot_of(*r) == Some(0)
+                        && !std::sync::Arc::ptr_eq(c, base)
+                        && hits.iter().any(|h| h.0 == *r && h.1 > 0)
+                        && same(c)
+                })
+                .max_by_key(|(r, _)| hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1))
+                .map(|(_, c)| c.clone());
+            let mut last = LAST_NORMALS.lock().unwrap_or_else(|e| e.into_inner());
+            match found {
+                Some(n) => {
+                    *last = Some(n.clone());
+                    Some(n)
+                }
+                None => last.clone().filter(|n| same(n)),
+            }
+        }
+        _ => None,
+    };
     if !(dump_on() && listed(frame)) {
         targets.clear();
     }
@@ -373,7 +404,7 @@ pub(crate) fn shown(frame: u64) -> Option<Shown> {
             .map(|(_, c)| c.clone()),
         None => None,
     };
-    (pick.is_some() || overlay.is_some()).then_some(Shown { base: pick, overlay })
+    (pick.is_some() || overlay.is_some()).then_some(Shown { base: pick, overlay, normals })
 }
 
 /// What show mode presents: a layer, and with `VICTORY_COMPOSE_UI` the UI
@@ -381,7 +412,28 @@ pub(crate) fn shown(frame: u64) -> Option<Shown> {
 pub(crate) struct Shown {
     pub(crate) base: Option<std::sync::Arc<crate::resource::HostTexture>>,
     pub(crate) overlay: Option<std::sync::Arc<crate::resource::HostTexture>>,
+    /// With `VICTORY_LIT`: the G-buffer normals the base is lit with.
+    pub(crate) normals: Option<std::sync::Arc<crate::resource::HostTexture>>,
 }
+
+/// `VICTORY_LIT=1` (with `VICTORY_SHOW_TARGET=busiest:<slot>`): the layer
+/// shown is lit by a simple sky and sun from the normals the frame wrote
+/// beside it (render target slot 0, the same size), in place of the
+/// title's own lighting, which needs programs that do not translate yet.
+pub(crate) fn lit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LIT").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_LIT: the layer shown is lit from the G-buffer's normals, not by the title");
+        }
+        on
+    })
+}
+
+/// The normals used last, kept for frames that write none.
+static LAST_NORMALS: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
 
 /// `VICTORY_COMPOSE_UI=1` (with `VICTORY_SHOW_TARGET`): the title's UI
 /// layer is blended over the layer shown. The console shows several
