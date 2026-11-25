@@ -287,9 +287,12 @@ fn host_lacks_target(format: u32) -> bool {
         let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
         let lacks = asked.is_err() || support.Support1.0 & needed != needed;
         if lacks {
+            // Not `target_format` here: it asks this very cell, which is
+            // still being filled (a hang at the first such texture).
+            let stand_in = if format == SHARED_EXPONENT { RGBA16_FLOAT } else { RGBA8_UNORM };
             tracing::info!(
                 format,
-                stand_in = target_format(format),
+                stand_in,
                 "render targets of this format are made in a stand-in format on this GPU"
             );
         }
