@@ -79,6 +79,30 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame the texture's contents were last found changed
+    /// (`VICTORY_TEXTURE_RECENT`).
+    changed: Option<u64>,
+}
+
+/// `VICTORY_TEXTURE_RECENT=<frames>` (0, off, by default): a texture in view
+/// memory whose contents changed within that many frames is hashed at every
+/// check, not only at its turn every eighth frame. A write to its pages
+/// through another view is not seen by the guard; textures the title
+/// rewrites every frame that way (start-up screens, the intro's video)
+/// showed old contents for up to 8 frames and flickered. Textures that stay
+/// the same keep the cheap guard.
+fn recent_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_RECENT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        if n > 0 {
+            tracing::warn!(frames = n, "VICTORY_TEXTURE_RECENT: textures changed that recently are hashed at every check");
+        }
+        n
+    })
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -951,8 +975,10 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            let frame = crate::frame::current();
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let recent = last.changed.is_some_and(|at| frame < at.saturating_add(recent_frames()));
+            if unwritten && !turn && !recent {
                 return 0;
             }
         }
@@ -1017,6 +1043,7 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
+                last.changed = Some(crate::frame::current());
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1033,6 +1060,7 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
+        last.changed = Some(crate::frame::current());
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);

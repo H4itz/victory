@@ -1408,7 +1408,27 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        // `VICTORY_HEAP_SPREAD=1`: the look at all slots is spread over the
+        // 16 passes (the slots whose number is the pass's modulo 16, with
+        // the changed ones) instead of taken whole every 16th pass, whose
+        // frame took 200-300 ms on a laptop (2026-11-25). Each slot is still
+        // looked at every 16 passes; one that left the set is dropped from
+        // `ranges` when its turn comes.
+        static SPREAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let spread = *SPREAD.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_HEAP_SPREAD").is_some_and(|v| v == "1");
+            if on {
+                tracing::warn!("VICTORY_HEAP_SPREAD: the look at all heap buffer views is spread over 16 passes");
+            }
+            on
+        });
+        let slots = if spread {
+            let turn = (*passes % 16) as u32;
+            ranges.retain(|&i, _| i % 16 != turn);
+            let mut slots: Vec<u32> = host.buffer_slots().into_iter().filter(|i| i % 16 == turn).collect();
+            slots.extend(changed.into_iter().filter(|i| i % 16 != turn));
+            slots
+        } else if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
