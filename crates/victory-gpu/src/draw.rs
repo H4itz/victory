@@ -855,13 +855,27 @@ impl State {
             return no("no view of memory");
         }
         if self.host_heaps != self.heaps && !(by_address && self.heaps[0] == 0) {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            // Our root signatures index the sampler heap directly, and D3D12
+            // wants one bound before such a root signature is set (the
+            // debug layer's error 1419, 1,158 times in a Series S cutscene
+            // on NVIDIA; what the card then does is undefined). Where the
+            // title bound only views, a heap of plain samplers of our own
+            // stands in: the console has none there either, so no shader
+            // of such a draw samples through it.
+            if self.heaps[1] == 0
+                && self.heaps[0] != 0
+                && let Some(spare) = spare_sampler_heap()
+            {
+                list.keep(&spare);
+                heaps.push(Some(spare));
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
@@ -2189,6 +2203,53 @@ fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// A shader-visible sampler heap of our own, as large as such a heap may be
+/// (2,048), every slot a plain linear sampler: bound beside a title's view
+/// heap when the title bound no sampler heap (see `bind`).
+#[cfg(windows)]
+fn spare_sampler_heap() -> Option<ID3D12DescriptorHeap> {
+    static HEAP: std::sync::OnceLock<Option<ID3D12DescriptorHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let host = crate::host::host()?;
+        const COUNT: u32 = 2048;
+        // SAFETY: a plain description; samplers written into our own heap.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: COUNT,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .inspect_err(|e| tracing::warn!(error = %e, "no spare sampler heap"))
+                .ok()?;
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            let desc = D3D12_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            for k in 0..COUNT as usize {
+                host.device.CreateSampler(
+                    &desc,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + k * step },
+                );
+            }
+            Some(heap)
+        }
+    })
+    .clone()
 }
 
 #[cfg(test)]
