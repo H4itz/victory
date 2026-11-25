@@ -662,6 +662,48 @@ impl State {
         Some(heap.memory())
     }
 
+    /// The view at table place `(slot, offset)` of `stage`'s, as bound for
+    /// draws or dispatches.
+    fn table_view(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        kind: ResourceType,
+        (slot, offset): (u8, u32),
+    ) -> Option<View> {
+        let u = stage.translated().used.iter().find(|u| {
+            u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        })?;
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            return None;
+        };
+        crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+    }
+
+    /// Before a dispatch of `p`: the upscaled scene it reads, filled where no
+    /// upscaler ran ([`crate::upscale`]). True if anything was recorded.
+    fn upscale(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.reads_upscaled) else {
+            return false;
+        };
+        match self.table_view(stage, true, ResourceType::Srv, crate::upscale::UPSCALED) {
+            Some(View::Shader(r, _)) => crate::upscale::fill(list, r as This),
+            _ => false,
+        }
+    }
+
+    /// Before a draw of `p`: the scene, if it is the program that reads it
+    /// for exposure ([`crate::upscale`]).
+    fn note_scene(&self, p: &crate::pipeline::host::HostPipeline) {
+        for stage in p.stages.iter().filter(|s| s.shader.reads_scene) {
+            if let Some(View::Shader(r, _)) =
+                self.table_view(stage, false, ResourceType::Srv, crate::upscale::SCENE)
+            {
+                crate::upscale::note_scene(r as This);
+            }
+        }
+    }
+
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
@@ -772,6 +814,7 @@ impl State {
             );
             return no("another kind of pipeline");
         }
+        self.note_scene(p);
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1069,6 +1112,9 @@ impl State {
             once!(x, y, z, "a dispatch past the host's group limits dropped");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+        if self.upscale(list, p) {
+            self.continue_in(list);
         }
         crate::twin::begin();
         if !self.bind(list, p, true) {

@@ -955,6 +955,19 @@ pub(crate) fn data_of(r: This) -> u64 {
     resource(r).data() as u64
 }
 
+/// When a list last moved `this` to a written state (render target or
+/// unordered access): a clock shared by all textures, 0 if never.
+#[cfg(windows)]
+pub(crate) fn written_clock(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this)
+        .host
+        .as_ref()
+        .map_or(0, |h| h.written.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// A list moves `texture` to `state`.
 #[cfg(windows)]
 pub(crate) fn note_written(resource_: This, state: u32) {

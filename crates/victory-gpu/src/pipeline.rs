@@ -75,6 +75,12 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::REFLECTED`]).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// It reads the scene for exposure, or first reads the upscaled scene
+    /// ([`crate::upscale`]).
+    #[cfg(windows)]
+    pub(crate) reads_scene: bool,
+    #[cfg(windows)]
+    pub(crate) reads_upscaled: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -219,10 +225,21 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     .windows(crate::ambient::REFLECTED.len())
                     .any(|w| w == crate::ambient::REFLECTED),
                 #[cfg(windows)]
+                reads_scene: contains(bytes, crate::upscale::SCENE_READER),
+                #[cfg(windows)]
+                reads_upscaled: contains(bytes, crate::upscale::UPSCALED_READER)
+                    && !contains(bytes, crate::upscale::NOT_UPSCALED_READER),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
+}
+
+/// Whether `bytes` hold `name` (a program's name in its container).
+#[cfg(windows)]
+fn contains(bytes: &[u8], name: &[u8]) -> bool {
+    bytes.windows(name.len()).any(|w| w == name)
 }
 
 /// A translated shader and the console resources its code reads.
