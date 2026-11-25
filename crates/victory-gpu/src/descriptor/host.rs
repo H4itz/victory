@@ -522,8 +522,17 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`] (NVIDIA): `VICTORY_CAPPED_DYNAMIC=<slots>` sets
+/// another (16,384 to 524,288), at the cost of the title's highest slots.
+fn dynamic_capped() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_CAPPED_DYNAMIC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1 << 16, |n| n.clamp(1 << 14, 1 << 19))
+    })
+}
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -695,14 +704,14 @@ impl HostHeap {
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = PORTABLE_VIEWS - dynamic_capped(),
+                    lost = wanted + dynamic_capped() - PORTABLE_VIEWS,
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
+                    PORTABLE_VIEWS - dynamic_capped() - crate::memory::SLOTS,
+                    dynamic_capped(),
                 )
             }
             Err(e) => {

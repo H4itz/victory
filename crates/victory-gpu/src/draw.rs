@@ -1278,12 +1278,29 @@ impl State {
         // leaves it empty, and it grows again.
         let mut made = std::mem::take(&mut self.made);
         made.clear();
+        // `VICTORY_NV_TABLES=1` (for a host that caps the view heap at
+        // 1,000,000 views, NVIDIA): only constant tables are made afresh
+        // (and, below, tables reaching past the host heap); tables of shader
+        // resources read the title's slots, as upstream does. A world frame
+        // asks for over 400,000 fresh slots with both kinds, and the capped
+        // heap's reserve is 65,536: past it the draws were dropped ("a table
+        // not made", about 1,000 a frame on an RTX 3050 laptop).
+        static NV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let nv = *NV.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_NV_TABLES").is_some_and(|v| v == "1");
+            if on {
+                tracing::warn!("VICTORY_NV_TABLES: only constant tables (and tables past the host heap) are made afresh");
+            }
+            on
+        });
         let mut fresh = Slots::default();
-        for u in used
-            .iter()
-            .filter(tables)
-            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
-        {
+        for u in used.iter().filter(tables).filter(|u| {
+            if nv {
+                u.kind == ResourceType::Cbv
+            } else {
+                matches!(u.kind, ResourceType::Cbv | ResourceType::Srv)
+            }
+        }) {
             fresh.insert(u.slot);
         }
         // Tables reaching past a host heap smaller than the title's (the
