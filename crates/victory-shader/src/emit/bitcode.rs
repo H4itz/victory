@@ -214,11 +214,30 @@ pub(crate) struct Module {
     func_ids: HashMap<String, u32>,
     insts: Vec<Inst>,
     blocks: Vec<Block>,
+    /// Blocks that go on in another ([`Module::continue_in`]).
+    moved: HashMap<usize, usize>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
 }
 
 impl Module {
+    /// The block what is added to `block` goes to: itself, or the block
+    /// it goes on in after a loop was put at its end.
+    fn here(&self, mut block: usize) -> usize {
+        while let Some(&next) = self.moved.get(&block) {
+            block = next;
+        }
+        block
+    }
+
+    /// From now on `from` goes on in `to` (a loop now ends `from`, whose
+    /// exit is `to`): instructions added to `from`, its terminator and phi
+    /// entries naming it as the block come from go to `to`; branches into
+    /// `from` still go there. For code that kept the block it started in.
+    pub fn continue_in(&mut self, from: usize, to: usize) {
+        self.moved.insert(from, to);
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
@@ -449,6 +468,7 @@ impl Module {
     }
 
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let block = self.here(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -540,9 +560,11 @@ impl Module {
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
+        let incoming = incoming.into_iter().map(|(v, b)| (v, self.here(b))).collect();
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.here(block);
         self.blocks[block].term = Some(t);
     }
 

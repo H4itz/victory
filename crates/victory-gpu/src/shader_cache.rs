@@ -85,6 +85,15 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
     match CACHE.get() {
         Some(cache) => {
             let mut key = key(build(), target);
+            // Translations that changed since entries of another build were
+            // made (`VICTORY_SHADER_BUILD_OF`): keyed apart.
+            let revision = victory_shader::emit::revision(container, target);
+            if revision != 0 {
+                let mut h = blake3::Hasher::new();
+                h.update(&key);
+                h.update(&revision.to_le_bytes());
+                key = *h.finalize().as_bytes();
+            }
             // A container a diagnostic patch may apply to has entries of its
             // own, by the patches.
             let patches = victory_shader::native::diagnostic_patches();

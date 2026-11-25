@@ -414,14 +414,23 @@ fn wave64_sums_match_the_console_on_every_adapter() {
             eprintln!("{name}: no SM 6.6 device; skipped");
             continue;
         };
-        // One console wave per group, and a group of its lower half only
-        // (lanes 32..63 inactive: they add 0).
-        for threads in [64, 32] {
+        // One console wave per group, a group of its lower half only
+        // (lanes 32..63 inactive: they add 0), and groups of two and four
+        // console waves (each summing its own 64 lanes), the last with a
+        // console wave of one half.
+        for threads in [64, 32, 128, 256, 160] {
             let p = program(WAVE64_SUM, threads);
             let groups = 3;
             let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let total: u32 = (0..threads).sum();
-            let want = vec![total; (threads * groups) as usize];
+            // Each console wave's sum of v0 (the thread id).
+            let want: Vec<u32> = (0..groups)
+                .flat_map(|_| {
+                    (0..threads).map(move |t| {
+                        let first = t / 64 * 64;
+                        (first..(first + 64).min(threads)).sum::<u32>()
+                    })
+                })
+                .collect();
             assert_eq!(out, want, "{name}: {threads} threads");
             eprintln!("{name}: wave64 sum over {threads} threads exact");
         }
@@ -439,6 +448,7 @@ fn lds_shared_across_the_halves_matches_the_console_on_every_adapter() {
             eprintln!("{name}: no SM 6.6 device; skipped");
             continue;
         };
+        // One console wave per group (group barriers), and one (pairs).
         let p = with_lds(program(&lds_across_halves(), 64));
         let groups = 3;
         let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -449,7 +459,7 @@ fn lds_shared_across_the_halves_matches_the_console_on_every_adapter() {
 }
 
 #[test]
-fn lane_ranks_in_groups_of_two_console_waves_match_the_host_waves_on_every_adapter() {
+fn lane_ranks_in_groups_of_two_console_waves_match_the_console_on_every_adapter() {
     let Ok(names) = adapters() else {
         eprintln!("no DXGI; skipped");
         return;
@@ -459,14 +469,14 @@ fn lane_ranks_in_groups_of_two_console_waves_match_the_host_waves_on_every_adapt
             eprintln!("{name}: no SM 6.6 device; skipped");
             continue;
         };
-        // The console's waves where the host runs them; else waves of the
-        // host's own, as the program compiled for 32-lane waves ranks.
-        let wave = if host.target().runs(64) { 64 } else { 32 };
+        // The console's ranks on any host: in the console flow where the
+        // host has no 64-lane waves.
+        let wave = 64;
         let p = program(WAVE_RANK, 128);
         let groups = 2;
         let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
         let want: Vec<u32> = (0..groups).flat_map(|_| (0..128).map(|t| t % wave)).collect();
         assert_eq!(out, want, "{name}");
-        eprintln!("{name}: lane ranks in waves of {wave} exact");
+        eprintln!("{name}: lane ranks of console waves exact");
     }
 }

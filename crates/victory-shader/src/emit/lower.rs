@@ -530,6 +530,10 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// Groups of several console waves in the console flow: per console
+    /// wave, the halves' rendezvous count and their exchange slots
+    /// ([`Self::pair_exchange`]).
+    pairs: Option<(V, V)>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -1204,11 +1208,14 @@ impl<'a> Lower<'a> {
             // barrier, which both halves reach ([`Lower::lds_order`]); also
             // for a program whose lanes read no other lane but share LDS in
             // one wave without barriers of its own.
+            // Groups of several console waves too: there the two halves of
+            // a console wave meet each other alone, not at group barriers
+            // ([`Lower::pair_exchange`]), as the waves of a group branch
+            // apart.
             wants_console_flow = (console_lanes && !split || one_wave && s.lds_dwords > 0)
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"));
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
@@ -1283,7 +1290,11 @@ impl<'a> Lower<'a> {
                 && !x.target.runs(64)
                 && x.target.runs(32)
                 && !x.console_cf
-                && (!wants_console_flow || x.per_lane_only)
+                // Not as the console flow's fallback: work spread over the
+                // console wave's 64 lanes (the compute shadow rasteriser's
+                // triangles) is half missing in each host wave; better
+                // dropped than drawn wrong.
+                && !wants_console_flow
                 && !(one_wave && s.lds_dwords > 0)
                 && live().filter(|i| whole(i)).all(host_wave_op);
             if host_waves {
@@ -1393,6 +1404,7 @@ impl<'a> Lower<'a> {
             wants_console_flow,
             console_flat: None,
             xchg: None,
+            pairs: None,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2133,6 +2145,9 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.new_block()
             });
+        }
+        if self.pair_mode() {
+            self.init_pairs();
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
@@ -3180,6 +3195,13 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
+            if self.pair_mode() {
+                // The halves meet in a loop, which cannot go into a block
+                // already lowered: the ballot of the same bits here (every
+                // lane runs every block), each time it is read.
+                let c = self.cur;
+                return Ok(self.console_ballot(c, bit));
+            }
             let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(xy);
@@ -3966,10 +3988,132 @@ impl<'a> Lower<'a> {
         {
             return;
         }
+        if self.pair_mode() {
+            // The two halves of this console wave only: the console's own
+            // barriers order the waves of the group.
+            self.pair_exchange(None);
+            return;
+        }
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
             .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// The console flow in halves in a group of several console waves: the
+    /// two halves of a console wave meet each other alone
+    /// ([`Self::pair_exchange`]), not at group barriers, which threads of
+    /// other console waves (whose wave-wide branches go their own way) may
+    /// never reach.
+    fn pair_mode(&self) -> bool {
+        self.console_cf && self.split && self.s.threads.is_some_and(|t| t.iter().product::<u32>() > 64)
+    }
+
+    /// Pair mode: the group-shared rendezvous counts (one per console wave)
+    /// and exchange slots (per console wave, two rounds of two halves),
+    /// the counts zeroed in the entry block, which every thread runs, behind
+    /// a group barrier.
+    fn init_pairs(&mut self) {
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let waves = threads.div_ceil(64);
+        let counts_t = self.s.m.array(waves, self.s.t.i32);
+        let counts = self.s.m.global("xchgn", counts_t, 3);
+        let slots_t = self.s.m.array(waves * 4, self.s.t.i32);
+        let slots = self.s.m.global("xchgw", slots_t, 3);
+        self.pairs = Some((counts, slots));
+        let e = self.s.entry;
+        let f = self.console_flat();
+        let k6 = self.s.m.i32(6);
+        let w = self.s.m.bin(e, Bin::LShr, f, k6);
+        let z = self.s.m.i32(0);
+        let at = self.s.m.element(e, counts, w);
+        self.s.m.store(e, at, z);
+        let void = self.s.t.void;
+        let mode = self.s.m.i32(1 | 8);
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// Pair mode: the two halves of this console wave meet; with `x` (the
+    /// same in all lanes of a half), both get (the lower half's, the upper
+    /// half's). Every lane adds 1 to its console wave's count and waits
+    /// until all `n` lanes of the console wave have for this round; no lane
+    /// adds for round g + 1 before every lane has for round g, so the count
+    /// read before adding gives the round, and rounds alternate between two
+    /// slot pairs (a half a round ahead writes the pair the other half has
+    /// read). A half that waits too long goes on (wrong values rather than a
+    /// GPU that stops). A console wave of one half has no other half: 0.
+    /// The halves of a console wave reach the same rendezvous in the same
+    /// order: in the console flow both run every block.
+    fn pair_exchange(&mut self, x: Option<V>) -> (V, V) {
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let (counts, slots) = self.pairs.expect("made in the entry block");
+        let c = self.cur;
+        let f = self.console_flat();
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k1, k5, k6, k64) = (k(self, 1), k(self, 5), k(self, 6), k(self, 64));
+        let w = self.s.m.bin(c, Bin::LShr, f, k6);
+        let half = self.s.m.bin(c, Bin::LShr, f, k5);
+        let half = self.s.m.bin(c, Bin::And, half, k1);
+        // Lanes of this console wave: 64, or what the group's last holds.
+        let n = if threads.is_multiple_of(64) {
+            k64
+        } else {
+            let base = self.s.m.bin(c, Bin::Shl, w, k6);
+            let t = k(self, threads);
+            let left = self.s.m.bin(c, Bin::Sub, t, base);
+            let more = self.s.m.cmp(c, pred::IUGT, left, k64);
+            self.s.m.select(c, more, k64, left)
+        };
+        let count = self.s.m.element(c, counts, w);
+        let z = k(self, 0);
+        let seen = self.s.m.atomic(c, Rmw::Add, count, z);
+        let round = self.s.m.bin(c, Bin::UDiv, seen, n);
+        let pair = self.s.m.bin(c, Bin::And, round, k1);
+        // Slot (w * 2 + pair) * 2 + half.
+        let w2 = self.s.m.bin(c, Bin::Shl, w, k1);
+        let wp = self.s.m.bin(c, Bin::Add, w2, pair);
+        let first = self.s.m.bin(c, Bin::Shl, wp, k1);
+        let void = self.s.t.void;
+        let fence = k(self, 8);
+        if let Some(x) = x {
+            let mine = self.s.m.bin(c, Bin::Add, first, half);
+            let at = self.s.m.element(c, slots, mine);
+            self.s.m.store(c, at, x);
+            self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        }
+        self.s.m.atomic(c, Rmw::Add, count, k1);
+        let next = self.s.m.bin(c, Bin::Add, round, k1);
+        let want = self.s.m.bin(c, Bin::Mul, next, n);
+        // Wait for the other half.
+        let wait = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        self.s.m.terminate(c, Term::Br(wait));
+        let tries = self.s.m.phi(wait, self.s.t.i32);
+        let now = self.s.m.atomic(wait, Rmw::Add, count, z);
+        let there = self.s.m.cmp(wait, pred::IUGE, now, want);
+        let more = self.s.m.bin(wait, Bin::Add, tries, k1);
+        let cap = self.s.m.i32(1 << 18);
+        let tired = self.s.m.cmp(wait, pred::IUGE, more, cap);
+        let go = self.s.m.bin(wait, Bin::Or, there, tired);
+        self.s.m.set_phi(tries, vec![(z, c), (more, wait)]);
+        self.s.m.terminate(wait, Term::CondBr(go, done, wait));
+        // Callers that kept `c` go on after the wait.
+        self.s.m.continue_in(c, done);
+        self.cur = done;
+        self.s.op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        if x.is_none() {
+            return (z, z);
+        }
+        let p0 = self.s.m.element(done, slots, first);
+        let second = self.s.m.bin(done, Bin::Add, first, k1);
+        let p1 = self.s.m.element(done, slots, second);
+        let lo = self.s.m.load(done, p0);
+        let hi = self.s.m.load(done, p1);
+        // A console wave of its lower half only.
+        let k32 = k(self, 32);
+        let both = self.s.m.cmp(done, pred::IUGT, n, k32);
+        let hi = self.s.m.select(done, both, hi, z);
+        (lo, hi)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -8350,7 +8494,11 @@ impl<'a> Lower<'a> {
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 self.cross_lane(false)?;
-                if self.split && !self.host_waves || self.console_cf {
+                // Rows of 16 and the two rows of a 32-lane half stay inside
+                // a host wave of 32 when split (host lanes are console lanes
+                // there); in the console flow without halves the wave is
+                // whole and EXEC does not hold.
+                if self.split && !self.host_waves && !self.console_cf || self.console_cf && !self.split {
                     return Err("a lane permutation in a program split in halves");
                 }
                 let l = self.lane_index();
@@ -12840,6 +12988,10 @@ impl<'a> Lower<'a> {
         let z = self.s.m.i32(0);
         if threads <= 32 {
             return (x, z);
+        }
+        if self.pair_mode() {
+            debug_assert_eq!(at, self.cur);
+            return self.pair_exchange(Some(x));
         }
         let (_, half) = self.console_lane();
         let slots = match self.xchg {

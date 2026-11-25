@@ -311,6 +311,23 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// [`translate`] for a host that runs the wave sizes of `target`.
+/// A number that changes with this translator's output for `container` on
+/// `target` where a cache's entries are reused across builds
+/// (`VICTORY_SHADER_BUILD_OF`, whose build key cannot tell): 0 for what
+/// translates as before; 1 for console wave64 compute programs on hosts
+/// without 64-lane waves (the console flow with wave sums, LDS and groups
+/// of several console waves). Raised when those translations change again.
+pub fn revision(container: &[u8], target: Target) -> u32 {
+    let Ok(c) = Container::parse(container) else {
+        return 0;
+    };
+    let Ok(programs) = crate::container_programs(&c) else {
+        return 0;
+    };
+    let wave64_compute = programs.iter().any(|p| p.stage == HwStage::Cs && p.wave64);
+    u32::from(wave64_compute && !target.runs(64))
+}
+
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let native = crate::container_programs(&c)?
@@ -1182,8 +1199,9 @@ mod tests {
             names,
             ["s_mov_b64", "s_bcnt1_i32_b64", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "s_endpgm"]
         );
-        // Two console waves per group: each host wave of 32 ranks its own
-        // lanes (checked on adapters in `split_tests`).
+        // Two console waves per group: the console flow with the halves of
+        // each console wave meeting alone (checked on adapters in
+        // `split_tests`: console ranks).
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, NVIDIA).is_ok());
         assert!(emit_for(&two, RDNA).is_ok());
@@ -1209,12 +1227,17 @@ mod tests {
         }
         assert!(emit_for(&p, NVIDIA).is_ok(), "LDS shared across the halves");
         assert!(emit_for(&p, RDNA).is_ok(), "LDS on RDNA");
-        // Two console waves per group: not in the console flow (a wave-wide
-        // branch of one would leave the other's threads out of its
-        // barriers) but in waves of the host's own, the sum then over each
-        // host wave (as the program compiled for 32-lane waves gives).
-        let p = compute_of(&store, true, 128);
-        assert!(emit_for(&p, NVIDIA).is_ok(), "sum in a group of two console waves");
+        // Two and four console waves per group: the console flow, the
+        // halves of each console wave meeting each other alone.
+        for threads in [128, 256] {
+            let p = compute_of(&store, true, threads);
+            assert!(emit_for(&p, NVIDIA).is_ok(), "sum in a group of {threads} threads");
+        }
+        let mut p = compute_of(&lds, true, 256);
+        if let crate::native::StageIo::Cs(io) = &mut p.io {
+            io.rsrc2 = 1 << 15;
+        }
+        assert!(emit_for(&p, NVIDIA).is_ok(), "LDS in a group of four console waves");
     }
 
     #[test]
@@ -1230,16 +1253,11 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: the halves of each console wave meet each other
+        // alone (the waves of a group branch apart), in the console flow.
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
-        assert_eq!(
-            emit_for(&two, NVIDIA),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
-            })
-        );
+        assert!(emit_for(&two, NVIDIA).is_ok());
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
