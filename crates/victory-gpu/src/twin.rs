@@ -14,7 +14,10 @@
 //! `R16_UNORM` (the console's 16-bit depth), stencil as `R8_UINT`. The
 //! title's unordered-access views are made on the twins, and right after a
 //! dispatch that wrote one, a small draw copies it into the depth texture
-//! (depth through `SV_Depth`, stencil through `SV_StencilRef`).
+//! (depth through `SV_Depth`, stencil through `SV_StencilRef`; on a host
+//! that takes no stencil from pixel shaders, NVIDIA, the stencil is
+//! cleared and each of its 8 bits drawn in turn: a draw that writes only
+//! that bit, discarding the pixels where the twin's bit is 0).
 //! Everything else (draws, shader reads, clears) keeps using the depth
 //! texture itself.
 //!
@@ -276,6 +279,19 @@ float depth_only(float4 at : SV_Position) : SV_Depth {
 uint stencil_only(float4 at : SV_Position) : SV_StencilRef {
     return stencil_.Load(int3(at.xy, 0));
 }
+#define RS_BIT "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=1, b0, visibility=SHADER_VISIBILITY_PIXEL)"
+cbuffer Bit : register(b0) { uint bit; };
+[RootSignature(RS_BIT)]
+float4 vs_bit(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+[RootSignature(RS_BIT)]
+void stencil_bit(float4 at : SV_Position) {
+    if (((stencil_.Load(int3(at.xy, 0)) >> bit) & 1) == 0) {
+        discard;
+    }
+}
 "#;
 
 /// Descriptor pairs, used in turn: more than the copies of every list in
@@ -293,6 +309,11 @@ struct Copier {
     stencil_only: ID3DBlob,
     /// Whether the host takes stencil values from pixel shaders.
     stencil_ref: bool,
+    /// Without that: the root signature, vertex and pixel programs that
+    /// write the stencil one bit per draw.
+    bits: Option<(ID3D12RootSignature, ID3DBlob, ID3DBlob)>,
+    /// By depth format and bit.
+    bit_pipelines: std::sync::Mutex<Vec<((i32, u8), ID3D12PipelineState)>>,
     /// By depth format, depth written, stencil written.
     pipelines: std::sync::Mutex<Vec<(PipelineKey, ID3D12PipelineState)>>,
     views: ID3D12DescriptorHeap,
@@ -360,9 +381,28 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
     }
     .is_ok()
         && options.PSSpecifiedStencilRefSupported.as_bool();
-    if !stencil_ref {
-        tracing::warn!("the host takes no stencil from pixel shaders: depth twins copy depth only");
-    }
+    // Without stencil from pixel shaders: one draw per stencil bit.
+    let bits = if stencil_ref {
+        None
+    } else {
+        let made = (|| -> windows::core::Result<_> {
+            let vs = compile(s!("vs_bit"), s!("vs_5_1"))?;
+            let ps = compile(s!("stencil_bit"), s!("ps_5_1"))?;
+            // SAFETY: a root signature the compiler embedded.
+            let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, bytes(&vs))? };
+            Ok((root, vs, ps))
+        })();
+        match made {
+            Ok(b) => {
+                tracing::info!("the host takes no stencil from pixel shaders: depth twins copy it one bit per draw");
+                Some(b)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the host takes no stencil from pixel shaders: depth twins copy depth only");
+                None
+            }
+        }
+    };
     // SAFETY: a root signature the compiler embedded.
     let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, bytes(&vs))? };
     // SAFETY: a plain description.
@@ -381,6 +421,8 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
         depth_only,
         stencil_only,
         stencil_ref,
+        bits,
+        bit_pipelines: std::sync::Mutex::new(Vec::new()),
         pipelines: std::sync::Mutex::new(Vec::new()),
         views,
         // SAFETY: a plain query.
@@ -464,6 +506,73 @@ impl Copier {
     }
 }
 
+impl Copier {
+    /// The draw that writes stencil bit `bit` of a `format` depth texture
+    /// where the twin's bit is set (the others discarded); no depth.
+    fn bit_pipeline(&self, host: &Host, format: DXGI_FORMAT, bit: u8) -> Option<ID3D12PipelineState> {
+        let (root, vs, ps) = self.bits.as_ref()?;
+        let key = (format.0, bit);
+        let mut made = self.bit_pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, p)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(p.clone());
+        }
+        let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+            // SAFETY: the blob lives as long as the copier.
+            pShaderBytecode: unsafe { b.GetBufferPointer() },
+            // SAFETY: as above.
+            BytecodeLength: unsafe { b.GetBufferSize() },
+        };
+        let face = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_REPLACE,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        };
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed for the call; the copier holds the root.
+            pRootSignature: unsafe { std::mem::transmute_copy(root) },
+            VS: code(vs),
+            PS: code(ps),
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: false.into(),
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                StencilEnable: true.into(),
+                StencilReadMask: 0xff,
+                StencilWriteMask: 1 << bit,
+                FrontFace: face,
+                BackFace: face,
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 0,
+            DSVFormat: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        // SAFETY: a complete description with live shaders and root.
+        match unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) } {
+            Ok(p) => {
+                made.push((key, p.clone()));
+                Some(p)
+            }
+            Err(e) => {
+                once!(error = %e, ?format, bit, "depth twin stencil bit pipeline refused");
+                None
+            }
+        }
+    }
+}
+
 fn copier(host: &Host) -> Option<&'static Copier> {
     static COPIER: std::sync::OnceLock<Option<Copier>> = std::sync::OnceLock::new();
     COPIER
@@ -486,10 +595,20 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
     let Some(c) = copier(host) else {
         return false;
     };
-    let stencil = stencil && c.stencil_ref && twin.stencil.is_some();
-    let Some(pso) = c.pipeline(host, twin.dsv_format, depth, stencil) else {
-        return false;
+    // The stencil by bits where the host takes none from pixel shaders.
+    let bit_psos: Vec<ID3D12PipelineState> = if stencil && !c.stencil_ref && twin.stencil.is_some() {
+        (0..8u8)
+            .map(|b| c.bit_pipeline(host, twin.dsv_format, b))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
     };
+    let stencil = stencil && c.stencil_ref && twin.stencil.is_some();
+    let pso = c.pipeline(host, twin.dsv_format, depth, stencil);
+    if pso.is_none() && bit_psos.is_empty() {
+        return false;
+    }
     let l = &list.list;
     const DEPTH_WRITE: u32 = 0x10;
     crate::list::ensure_state(list, resource, DEPTH_WRITE);
@@ -544,14 +663,9 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
         let dsv = host.dsv(texture, Some(&dsv_desc));
         l.OMSetRenderTargets(0, None, false, Some(&dsv));
         l.SetDescriptorHeaps(&[Some(c.views.clone())]);
-        l.SetGraphicsRootSignature(&c.root);
-        l.SetPipelineState(&pso);
-        l.SetGraphicsRootDescriptorTable(
-            0,
-            D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: gpu.ptr + u64::from(first) * u64::from(c.step),
-            },
-        );
+        let table = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: gpu.ptr + u64::from(first) * u64::from(c.step),
+        };
         l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         l.RSSetViewports(&[D3D12_VIEWPORT {
             Width: twin.width as f32,
@@ -565,14 +679,36 @@ fn copy(list: &HostList, resource: This, depth: bool, stencil: bool) -> bool {
             right: twin.width as i32,
             bottom: twin.height as i32,
         }]);
-        l.DrawInstanced(3, 1, 0, 0);
+        if let Some(pso) = &pso {
+            l.SetGraphicsRootSignature(&c.root);
+            l.SetPipelineState(pso);
+            l.SetGraphicsRootDescriptorTable(0, table);
+            l.DrawInstanced(3, 1, 0, 0);
+        }
+        if let (false, Some((root, _, _))) = (bit_psos.is_empty(), &c.bits) {
+            // Every bit 0, then each bit set where the twin's is.
+            l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_STENCIL, 0.0, 0, None);
+            l.SetGraphicsRootSignature(root);
+            l.SetGraphicsRootDescriptorTable(0, table);
+            l.OMSetStencilRef(0xff);
+            for (bit, p) in bit_psos.iter().enumerate() {
+                l.SetPipelineState(p);
+                l.SetGraphicsRoot32BitConstant(1, bit as u32, 0);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+        }
         l.ResourceBarrier(&barriers(
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ));
     }
     list.keep(&c.views);
-    list.keep(&pso);
+    if let Some(pso) = &pso {
+        list.keep(pso);
+    }
+    for p in &bit_psos {
+        list.keep(p);
+    }
     list.keep(&twin.depth);
     if let Some(s) = &twin.stencil {
         list.keep(s);
