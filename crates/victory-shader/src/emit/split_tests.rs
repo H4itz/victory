@@ -5,7 +5,7 @@
 //! half run as two host waves of 32 (see `lower::Lower::new`).
 
 use super::host::{Dispatch, Host, Root, View, adapters};
-use super::tests::{WAVE64_SUM, compute, emit_for, lds_across_halves};
+use super::tests::{WAVE_RANK, WAVE64_SUM, compute, emit_for, lds_across_halves};
 use crate::native::{RootParam, RootType, StageIo};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -445,5 +445,28 @@ fn lds_shared_across_the_halves_matches_the_console_on_every_adapter() {
         let want: Vec<u32> = (0..groups).flat_map(|_| (0..64).map(|t| t ^ 32)).collect();
         assert_eq!(out, want, "{name}");
         eprintln!("{name}: LDS across the halves exact");
+    }
+}
+
+#[test]
+fn lane_ranks_in_groups_of_two_console_waves_match_the_host_waves_on_every_adapter() {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            eprintln!("{name}: no SM 6.6 device; skipped");
+            continue;
+        };
+        // The console's waves where the host runs them; else waves of the
+        // host's own, as the program compiled for 32-lane waves ranks.
+        let wave = if host.target().runs(64) { 64 } else { 32 };
+        let p = program(WAVE_RANK, 128);
+        let groups = 2;
+        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let want: Vec<u32> = (0..groups).flat_map(|_| (0..128).map(|t| t % wave)).collect();
+        assert_eq!(out, want, "{name}");
+        eprintln!("{name}: lane ranks in waves of {wave} exact");
     }
 }

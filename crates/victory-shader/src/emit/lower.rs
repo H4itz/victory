@@ -519,6 +519,10 @@ struct Lower<'a> {
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
+    /// A console wave64 program in waves of the host's own (two of 32 per
+    /// console wave, split): masks read as numbers are the host wave's
+    /// ([`MaskData::Host`]), wave reductions are over the host wave.
+    host_waves: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// The console thread's flat id in the group (relabelled; see
@@ -1111,6 +1115,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
+        let mut host_waves = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1222,6 +1227,71 @@ impl<'a> Lower<'a> {
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
                 && !insts().any(|i| i.name().contains("permute"))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // A console wave64 program on a host of 32-lane waves that runs
+            // neither in independent halves nor in the console flow (groups
+            // of several console waves, or the console flow could not lower
+            // it): each host wave is a wave of its own, as when the program
+            // is compiled for a GPU of 32-lane waves. Its lane masks read as
+            // numbers are the host wave's ([`MaskData::Host`]): counts, the
+            // first lane, the count of lanes below, equality, which is how
+            // the console compiler expands an aggregated atomic (one lane
+            // adds the count, each lane takes the base plus its rank): the
+            // same slots, taken in another order. Whole-wave sections
+            // reduce over the host wave. Lane reads stay inside the 32 lanes
+            // a host wave holds (rows, the first lane of a mask, and the
+            // halves' totals that sections combine). Not where masks are
+            // held as constant lane sets, nor in a group of one console
+            // wave sharing LDS (the console flow's barriers serve those).
+            // shortcut: in a group of several console waves, LDS that one
+            // console wave's lanes exchange without a barrier of their own
+            // (its two halves are two host waves here) may be read before
+            // the other half wrote it; the console compiler's barriers
+            // between waves are kept. Such passes were dropped whole before.
+            let host_wave_op = |i: &Inst| {
+                let n = i.name();
+                n.starts_with("s_bcnt1_i32_")
+                    || n.starts_with("s_ff1_i32_")
+                    || n.starts_with("v_mbcnt_")
+                    || n.starts_with("s_cmp_eq_u")
+                    || n.starts_with("s_cmp_lg_u")
+                    || n.starts_with("v_permlane")
+                    || matches!(n, "v_readlane_b32" | "v_readfirstlane_b32")
+            };
+            // A lane read by number outside a whole-wave section is the
+            // console's lane for all 64 lanes, which the upper half's host
+            // wave does not hold: not in waves of the host's own.
+            let in_sections: HashSet<*const Inst> = (0..p.blocks.len())
+                .flat_map(|b| {
+                    super::wave::sections(p, b).into_iter().flat_map(move |(start, sec)| {
+                        p.blocks[b].insts[start..=sec.end.min(p.blocks[b].insts.len() - 1)]
+                            .iter()
+                            .map(|i| i as *const Inst)
+                    })
+                })
+                .collect();
+            let fixed_lane = |i: &Inst| {
+                i.name() == "v_readlane_b32"
+                    && !in_sections.contains(&(i as *const Inst))
+                    && matches!(&i.fields, Fields::Valu(v)
+                        if matches!(v.src.get(1), Some(Operand::Const(_) | Operand::Literal(_))))
+            };
+            host_waves = console_lanes
+                && !split
+                && !masks_held
+                && !live().any(fixed_lane)
+                && x.native.wave64
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && !x.console_cf
+                && (!wants_console_flow || x.per_lane_only)
+                && !(one_wave && s.lds_dwords > 0)
+                && live().filter(|i| whole(i)).all(host_wave_op);
+            if host_waves {
+                // Two host waves of 32, each lane at its console lane's place
+                // in its half (as `split`), masks the host wave's.
+                split = true;
+                wants_console_flow = false;
+            }
             if x.console_cf {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
@@ -1318,6 +1388,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             numeric_selects,
             split,
+            host_waves,
             console_cf: x.console_cf,
             wants_console_flow,
             console_flat: None,
@@ -1331,6 +1402,7 @@ impl<'a> Lower<'a> {
             },
             half_input_spills: half_input_spills(&half_inputs(&x.native.io, &x.inputs), &x.inputs),
             mask_data: match x.native.stage {
+                HwStage::Cs if host_waves => MaskData::Host,
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs | HwStage::Ms => MaskData::Host,
                 _ => MaskData::None,
@@ -1853,8 +1925,8 @@ impl<'a> Lower<'a> {
         // In halves (a console wave64 on a host of 32-lane waves) only in
         // the console flow, where both halves reach every exchange: each
         // half's result is joined with the other's ([`Self::join_halves`]).
-        let halves = self.split;
-        if halves && !self.console_cf {
+        let halves = self.split && self.console_cf;
+        if self.split && !self.console_cf && !self.host_waves {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -3112,7 +3184,7 @@ impl<'a> Lower<'a> {
             self.ballots.insert(lo, xy);
             return Ok(xy);
         }
-        if self.split {
+        if self.split && !self.host_waves {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
         if !self.x.st.active.contains(&lo) {
@@ -3773,7 +3845,7 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64; host lane = console
     /// lane, so not in a program split in halves).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        debug_assert!(!self.split || self.console_cf);
+        debug_assert!(!self.split || self.console_cf || self.host_waves);
         if self.console_cf {
             // The console lane's bit: its half's word, its host lane's bit.
             let (lane, half) = self.console_lane();
@@ -8278,7 +8350,7 @@ impl<'a> Lower<'a> {
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 self.cross_lane(false)?;
-                if self.split || self.console_cf {
+                if self.split && !self.host_waves || self.console_cf {
                     return Err("a lane permutation in a program split in halves");
                 }
                 let l = self.lane_index();
@@ -8311,6 +8383,12 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                // In waves of the host's own a lane by number is the console
+                // wave's, which this host wave may not hold (computed lanes,
+                // from its masks, are its own).
+                if self.host_waves && self.s.m.int_value(lane).is_some() {
+                    return Err("a lane read by number in waves of the host's own");
+                }
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {

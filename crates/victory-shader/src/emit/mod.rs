@@ -1158,6 +1158,37 @@ mod tests {
         w
     }
 
+    /// The console compiler's lane rank (an aggregated atomic's slot within
+    /// the wave): EXEC copied, its lanes counted, then each lane's count of
+    /// lanes below it (v2). Encoded after the `v_readlane_b32` and SOP1
+    /// words above (VOP3 0x365/0x366, SOP1 4 and 16).
+    pub(super) const WAVE_RANK: &[u32] = &[
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0xBE8C_100A, // s_bcnt1_i32_b64 s12, s[10:11]
+        0xD765_0001,
+        0x0001_000A, // v_mbcnt_lo_u32_b32 v1, s10, 0
+        0xD766_0002,
+        0x0002_020B, // v_mbcnt_hi_u32_b32 v2, s11, v1
+    ];
+
+    #[test]
+    fn a_lane_rank_runs_in_waves_of_the_host_s_own_in_groups_of_several_console_waves() {
+        let mut words = WAVE_RANK.to_vec();
+        words.push(0xBF81_0000); // s_endpgm
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).unwrap();
+        let names: Vec<&str> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(
+            names,
+            ["s_mov_b64", "s_bcnt1_i32_b64", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "s_endpgm"]
+        );
+        // Two console waves per group: each host wave of 32 ranks its own
+        // lanes (checked on adapters in `split_tests`).
+        let two = compute_of(&words, true, 128);
+        assert!(emit_for(&two, NVIDIA).is_ok());
+        assert!(emit_for(&two, RDNA).is_ok());
+    }
+
     #[test]
     fn wave64_sums_and_lds_translate_for_hosts_of_32_lane_waves() {
         // The console flow in halves: the halves' sums joined through
@@ -1178,10 +1209,12 @@ mod tests {
         }
         assert!(emit_for(&p, NVIDIA).is_ok(), "LDS shared across the halves");
         assert!(emit_for(&p, RDNA).is_ok(), "LDS on RDNA");
-        // Two console waves per group: still refused (a wave-wide branch
-        // of one would leave the other's threads out of the barriers).
+        // Two console waves per group: not in the console flow (a wave-wide
+        // branch of one would leave the other's threads out of its
+        // barriers) but in waves of the host's own, the sum then over each
+        // host wave (as the program compiled for 32-lane waves gives).
         let p = compute_of(&store, true, 128);
-        assert!(emit_for(&p, NVIDIA).is_err());
+        assert!(emit_for(&p, NVIDIA).is_ok(), "sum in a group of two console waves");
     }
 
     #[test]
