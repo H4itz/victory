@@ -301,13 +301,21 @@ fn save_snaps() {
     }
 }
 
+/// Whether the draws and dispatches of the frames whose targets are saved
+/// are written down (`passes.txt`): with `VICTORY_DUMP_RAW`, or alone with
+/// `VICTORY_DUMP_PASSES` (no raw image files).
+fn passes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_DUMP_RAW").is_some() || std::env::var_os("VICTORY_DUMP_PASSES").is_some()
+    })
+}
+
 /// Notes a draw or dispatch of `list`.
 pub(crate) fn pass(list: &crate::host::HostList, target: usize, text: impl FnOnce() -> String) {
-    if dump_on()
-        && std::env::var_os("VICTORY_DUMP_RAW").is_some()
-        && listed(crate::queue::presented() + 1)
-    {
-        let text = text();
+    if dump_on() && passes_on() && listed(crate::queue::presented() + 1) {
+        // The first target, as the saved pictures name it.
+        let text = format!("{} -> target {:?}", text(), target as crate::object::This);
         snap(list, &text, target);
         PASSES
             .lock()
