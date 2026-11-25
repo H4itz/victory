@@ -241,6 +241,14 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// host cannot make (see [`target_format`]).
 const RGBA8_UNORM: u32 = 28;
 
+/// R16G16B16A16_FLOAT, which stands in for a shared-exponent (R9G9B9E5)
+/// render target or unordered-access texture the host cannot make: at
+/// least its precision and range. Grand Theft Auto VI renders to one,
+/// 1920x1080, on Series S; NVIDIA can neither render to nor write it, so
+/// the texture lost both uses and the first barrier into either state was
+/// refused (the list did not close, "Missing resource bind flags").
+const RGBA16_FLOAT: u32 = 10;
+
 /// The console's packed 16-bit colour formats a title renders to:
 /// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
 const PACKED_16: [u32; 2] = [86, 115];
@@ -254,8 +262,12 @@ fn host_lacks_target(format: u32) -> bool {
     use std::sync::OnceLock;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
-    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
+    static LACKS: [OnceLock<bool>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    let Some(i) = PACKED_16
+        .iter()
+        .chain(&[SHARED_EXPONENT])
+        .position(|&f| f == format)
+    else {
         return false;
     };
     *LACKS[i].get_or_init(|| {
@@ -275,7 +287,11 @@ fn host_lacks_target(format: u32) -> bool {
         let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
         let lacks = asked.is_err() || support.Support1.0 & needed != needed;
         if lacks {
-            tracing::info!(format, "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU");
+            tracing::info!(
+                format,
+                stand_in = target_format(format),
+                "render targets of this format are made in a stand-in format on this GPU"
+            );
         }
         lacks
     })
@@ -295,9 +311,26 @@ pub(crate) fn target_format(format: u32) -> u32 {
     let format = pc_format(format);
     if PACKED_16.contains(&format) && host_lacks_target(format) {
         RGBA8_UNORM
+    } else if format == SHARED_EXPONENT && host_lacks_target(format) {
+        RGBA16_FLOAT
     } else {
         format
     }
+}
+
+/// Whether the host copy of the title texture `this` is in a stand-in
+/// format ([`target_format`]): its texels are not laid out as the title's,
+/// so the host cannot copy between it and a texture in the title's format.
+#[cfg(windows)]
+pub(crate) fn stands_in(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let own = pc_format(resource(this).desc.format);
+    target_format(own) != own
+        && host_resource(this)
+            // SAFETY: a live resource.
+            .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
 }
 
 /// The typeless format of a format's family (itself if it has none).

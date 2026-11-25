@@ -648,6 +648,21 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether one of two resources is a target in a stand-in format and the
+/// other is not ([`crate::resource::target_format`]): their texels differ,
+/// so the host cannot copy between them (logged once).
+#[cfg(windows)]
+fn unlike(dst: This, src: This) -> bool {
+    let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
+    if unlike {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
+        });
+    }
+    unlike
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
@@ -665,6 +680,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             // shortcut: not between textures without their largest mips.
             if crate::resource::skipped_mips(dst) + crate::resource::skipped_mips(src) > 0 {
+                return;
+            }
+            if unlike(dst, src) {
                 return;
             }
             if crate::texture::title_written(from) {
@@ -770,6 +788,12 @@ extern "system" fn copy_texture_region(
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        // A stand-in target's texels are not the title's: no copy to or
+        // from it, read-backs included (to a buffer, the footprint names
+        // the title's format).
+        if unlike(dst.resource, src.resource) || (dst.kind == FOOTPRINT && crate::resource::stands_in(src.resource)) {
+            return;
+        }
         if dst.kind == FOOTPRINT {
             if src.kind == FOOTPRINT {
                 return;
@@ -1047,6 +1071,9 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        if unlike(dst, src) {
+            return;
+        }
         ensure_state(&list, dst, RESOLVE_DEST);
         ensure_state(&list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1055,7 +1082,8 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
+            // A stand-in target resolves in the format it has.
+            let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
