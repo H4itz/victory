@@ -5,7 +5,7 @@
 //! half run as two host waves of 32 (see `lower::Lower::new`).
 
 use super::host::{Dispatch, Host, Root, View, adapters};
-use super::tests::{compute, emit_for};
+use super::tests::{WAVE64_SUM, compute, emit_for, lds_across_halves};
 use crate::native::{RootParam, RootType, StageIo};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -393,4 +393,57 @@ fn loops_with_an_exit_mask_grown_from_zero() {
         0x4A04_040C, // v_add_nc_u32 v2, s12, v2
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+}
+
+/// `program` with one 512-byte LDS granule.
+fn with_lds(mut p: crate::NativeProgram) -> crate::NativeProgram {
+    if let StageIo::Cs(io) = &mut p.io {
+        io.rsrc2 |= 1 << 15;
+    }
+    p
+}
+
+#[test]
+fn wave64_sums_match_the_console_on_every_adapter() {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            eprintln!("{name}: no SM 6.6 device; skipped");
+            continue;
+        };
+        // One console wave per group, and a group of its lower half only
+        // (lanes 32..63 inactive: they add 0).
+        for threads in [64, 32] {
+            let p = program(WAVE64_SUM, threads);
+            let groups = 3;
+            let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let total: u32 = (0..threads).sum();
+            let want = vec![total; (threads * groups) as usize];
+            assert_eq!(out, want, "{name}: {threads} threads");
+            eprintln!("{name}: wave64 sum over {threads} threads exact");
+        }
+    }
+}
+
+#[test]
+fn lds_shared_across_the_halves_matches_the_console_on_every_adapter() {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            eprintln!("{name}: no SM 6.6 device; skipped");
+            continue;
+        };
+        let p = with_lds(program(&lds_across_halves(), 64));
+        let groups = 3;
+        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let want: Vec<u32> = (0..groups).flat_map(|_| (0..64).map(|t| t ^ 32)).collect();
+        assert_eq!(out, want, "{name}");
+        eprintln!("{name}: LDS across the halves exact");
+    }
 }

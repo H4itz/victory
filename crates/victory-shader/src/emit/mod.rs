@@ -1108,6 +1108,82 @@ mod tests {
         lanes_max: 64,
     };
 
+    /// Assembled with llvm-mc (gfx1030, wave64), as in `wave.rs`'s
+    /// `wave64_halves_combine_in_a_scalar_add`: v0 summed over the console
+    /// wave (each half of 32 with DPP and `v_permlanex16`, then lanes 0 and 32
+    /// read and added), the total moved to v2.
+    pub(super) const WAVE64_SUM: &[u32] = &[
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s[0:1]
+        0x4A02_02FA,
+        0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+        0x4A02_02FA,
+        0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+        0x4A02_02FA,
+        0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+        0x4A02_02FA,
+        0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0xD760_0002,
+        0x0001_0101, // v_readlane_b32 s2, v1, 0
+        0xD760_0003,
+        0x0001_4101, // v_readlane_b32 s3, v1, 32
+        0x8002_0302, // s_add_u32 s2, s2, s3
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E04_0202, // v_mov_b32 v2, s2
+    ];
+
+    /// A DS instruction: `op` with `vdst`, address `addr`, `data0`, `offset`.
+    const fn ds(op: u8, vdst: u8, addr: u8, data0: u8, offset: u16) -> [u32; 2] {
+        [
+            0x36 << 26 | (op as u32) << 18 | offset as u32,
+            (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32,
+        ]
+    }
+
+    /// Lane t writes t to LDS dwords t and t + 64, then reads dword t + 32,
+    /// with no barrier between: in one console wave the write is seen, and the
+    /// value is t ^ 32, which the other half of the wave wrote.
+    pub(super) fn lds_across_halves() -> Vec<u32> {
+        const WRITE: u8 = 0x0D;
+        const READ: u8 = 0x36;
+        let mut w = vec![0x3406_0082]; // v_lshlrev_b32 v3, 2, v0
+        w.extend(ds(WRITE, 0, 3, 0, 0)); // ds_write_b32 v3, v0
+        w.extend(ds(WRITE, 0, 3, 0, 256)); // ds_write_b32 v3, v0 offset:256
+        w.extend(ds(READ, 2, 3, 0, 128)); // ds_read_b32 v2, v3 offset:128
+        w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+        w
+    }
+
+    #[test]
+    fn wave64_sums_and_lds_translate_for_hosts_of_32_lane_waves() {
+        // The console flow in halves: the halves' sums joined through
+        // group-shared memory, LDS accesses behind group barriers. (Run on
+        // adapters in `split_tests`.)
+        let mut store = WAVE64_SUM.to_vec();
+        store.push(0xBF81_0000); // s_endpgm
+        for threads in [64, 32] {
+            let p = compute_of(&store, true, threads);
+            assert!(emit_for(&p, NVIDIA).is_ok(), "sum, {threads} threads");
+            assert!(emit_for(&p, RDNA).is_ok(), "sum on RDNA, {threads} threads");
+        }
+        let mut lds = lds_across_halves();
+        lds.extend([0x7E02_0302, 0xBF81_0000]); // v_mov_b32 v1, v2; s_endpgm
+        let mut p = compute_of(&lds, true, 64);
+        if let crate::native::StageIo::Cs(io) = &mut p.io {
+            io.rsrc2 = 1 << 15; // one 512-byte LDS granule
+        }
+        assert!(emit_for(&p, NVIDIA).is_ok(), "LDS shared across the halves");
+        assert!(emit_for(&p, RDNA).is_ok(), "LDS on RDNA");
+        // Two console waves per group: still refused (a wave-wide branch
+        // of one would leave the other's threads out of the barriers).
+        let p = compute_of(&store, true, 128);
+        assert!(emit_for(&p, NVIDIA).is_err());
+    }
+
     #[test]
     fn console_lanes_translate_only_for_hosts_with_that_wave_size() {
         let words = [

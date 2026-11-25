@@ -1193,15 +1193,18 @@ impl<'a> Lower<'a> {
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
-                && !split
+            // Whole-wave sections (wave reductions and prefix sums) join
+            // the halves' results through the same exchange. LDS shared
+            // within the console wave too: every access waits at a group
+            // barrier, which both halves reach ([`Lower::lds_order`]); also
+            // for a program whose lanes read no other lane but share LDS in
+            // one wave without barriers of its own.
+            wants_console_flow = (console_lanes && !split || one_wave && s.lds_dwords > 0)
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !insts().any(|i| i.name().contains("permute"));
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
             // [`CONSOLE_FLOW`]).
@@ -1847,7 +1850,11 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        // In halves (a console wave64 on a host of 32-lane waves) only in
+        // the console flow, where both halves reach every exchange: each
+        // half's result is joined with the other's ([`Self::join_halves`]).
+        let halves = self.split;
+        if halves && !self.console_cf {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -1922,6 +1929,11 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        let r = if halves {
+            self.join_halves(c, op, prefix.is_some(), arg, r, float)
+        } else {
+            r
+        };
         Ok(if f16 {
             self.s
                 .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
@@ -1930,6 +1942,66 @@ impl<'a> Lower<'a> {
         } else {
             r
         })
+    }
+
+    /// Console flow in halves (a console wave64 run as two host waves of 32,
+    /// see [`CONSOLE_FLOW`]): `r`, one half's reduction of `arg` by `op` (or
+    /// its prefix sum), as the console wave's. The halves exchange their
+    /// totals through group-shared memory ([`Self::exchange`]) and both
+    /// combine them; a prefix sum in the upper half adds the lower half's
+    /// total. Inactive console lanes hold the identity already. A group of
+    /// 32 threads or fewer is one host wave: nothing to join.
+    fn join_halves(&mut self, c: usize, op: super::wave::Op, prefix: bool, arg: V, r: V, float: bool) -> V {
+        use super::wave::Op;
+        let threads: u32 = self.s.threads.map_or(64, |t| t.iter().product());
+        if threads <= 32 {
+            return r;
+        }
+        let word = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
+        let value = |l: &mut Self, v: V| if float { l.as_float(v) } else { v };
+        if prefix {
+            // This half's total (the identity of a sum is 0 in both forms).
+            let ty = if float { self.s.t.f32 } else { self.s.t.i32 };
+            let sfx = if float { "f32" } else { "i32" };
+            let (k, u) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+            let total = self.s.op(
+                c,
+                &format!("waveActiveOp.{sfx}"),
+                Attr::NoUnwind,
+                ty,
+                119,
+                &[arg, k, u],
+            );
+            let total = word(self, total);
+            let (lo, _) = self.exchange(c, total);
+            let lo = value(self, lo);
+            let (_, half) = self.console_lane();
+            let one = self.s.m.i32(1);
+            let upper = self.s.m.cmp(c, pred::EQ, half, one);
+            let z = self.s.m.i32(0);
+            let zero = value(self, z);
+            let add = self.s.m.select(c, upper, lo, zero);
+            return self.s.m.bin(c, Bin::Add, r, add);
+        }
+        let w = word(self, r);
+        let (lo, hi) = self.exchange(c, w);
+        let (lo, hi) = (value(self, lo), value(self, hi));
+        let pick = |l: &mut Self, p: u8| {
+            let first = l.s.m.cmp(c, p, lo, hi);
+            l.s.m.select(c, first, lo, hi)
+        };
+        match op {
+            Op::AddU | Op::AddF | Op::AddF16 => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
+            Op::And => self.s.m.bin(c, Bin::And, lo, hi),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
+            Op::MinU => pick(self, pred::IULT),
+            Op::MaxU => pick(self, pred::IUGT),
+            Op::MinI => pick(self, pred::SLT),
+            Op::MaxI => pick(self, pred::SGT),
+            Op::MinF => pick(self, pred::OLT),
+            Op::MaxF => pick(self, pred::OGT),
+        }
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -3806,6 +3878,28 @@ impl<'a> Lower<'a> {
         inst.write(pick(reg)?)
     }
 
+    /// Console flow in halves (a console wave64 run as two host waves of
+    /// 32): a group barrier before each LDS access. The console compiler
+    /// leaves out barriers between the lanes of one wave, which run in step;
+    /// two host waves do not, so a half could read before the other half's
+    /// write (or write over what it has yet to read). Every thread of the
+    /// group reaches the barrier: in the console flow every lane runs every
+    /// block, and the per-lane guard of the access comes after it. Lane
+    /// swizzles and permutes through the DS unit touch no LDS.
+    fn lds_order(&mut self, name: &str) {
+        let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if !(self.console_cf && self.split && threads > 32 && self.s.lds_dwords > 0)
+            || name.starts_with("ds_swizzle")
+            || name.contains("permute")
+        {
+            return;
+        }
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         if self.console_cf {
             // Every lane is here: EXEC is the guard. Lane reads and writes
@@ -4972,6 +5066,9 @@ impl<'a> Lower<'a> {
             && self.ordered();
         if fence {
             self.uav_fence();
+        }
+        if matches!(inst.fields, Fields::Ds { .. }) {
+            self.lds_order(name);
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
