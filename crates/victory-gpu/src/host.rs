@@ -3576,7 +3576,13 @@ impl Presenter {
             device.CreateRenderTargetView(back, None, view);
             if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
                 list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+                // One rectangle a clear: NVIDIA's driver (32.0.16.2124, RTX
+                // 3050) failed its stack check on a clear of the text's
+                // hundred-odd rectangles at once (fail-fast in
+                // nvwgf2umx.dll at the first readout).
+                for mark in &marks {
+                    list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(std::slice::from_ref(mark)));
+                }
             }
         }
     }
