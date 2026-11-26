@@ -1347,6 +1347,7 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        self.note_scene(p);
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1445,13 +1446,26 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            // Our root signatures index the sampler heap directly, and D3D12
+            // wants one bound before such a root signature is set (the debug
+            // layer's error 1419, 1,158 times in a Series S cutscene on an
+            // RTX 3050; what the card then does is undefined). Where the
+            // title bound only views, a heap of plain samplers of our own
+            // stands in: the console has none there either, so no shader of
+            // such a draw samples through it.
+            if self.heaps[1] == 0
+                && self.heaps[0] != 0
+                && let Some(spare) = spare_sampler_heap()
+            {
+                heaps.push(Some(spare));
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
@@ -2640,6 +2654,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if self.upscale(list, p) {
+            // Our draw set its own state on the list: the title's again.
+            self.replay(list);
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2683,6 +2701,46 @@ impl State {
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+        }
+    }
+
+    /// The view at table place `(slot, offset)` of `stage`'s, as bound for
+    /// draws or dispatches.
+    fn table_view(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        kind: ResourceType,
+        (slot, offset): (u8, u32),
+    ) -> Option<View> {
+        stage.translated().used.iter().find(|u| {
+            u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        })?;
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return None;
+        };
+        crate::descriptor::view(table + u64::from(offset) * 4)
+    }
+
+    /// Before a dispatch of `p`: the upscaled scene it reads, filled where no
+    /// upscaler ran ([`crate::upscale`]). True if anything was recorded.
+    fn upscale(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.reads_upscaled) else {
+            return false;
+        };
+        match self.table_view(stage, true, ResourceType::Srv, crate::upscale::UPSCALED) {
+            Some(View::Shader(r, _)) => crate::upscale::fill(list, r as This),
+            _ => false,
+        }
+    }
+
+    /// Before a draw of `p`: the scene, if it is the program that reads it
+    /// for exposure ([`crate::upscale`]).
+    fn note_scene(&self, p: &HostPipeline) {
+        for stage in p.stages.iter().filter(|s| s.shader.reads_scene) {
+            if let Some(View::Shader(r, _)) = self.table_view(stage, false, ResourceType::Srv, crate::upscale::SCENE) {
+                crate::upscale::note_scene(r as This);
+            }
         }
     }
 
@@ -4468,4 +4526,51 @@ mod record_hash_tests {
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
+}
+
+/// A shader-visible sampler heap of our own, as large as such a heap may be
+/// (2,048), every slot a plain linear sampler: bound beside a title's view
+/// heap when the title bound no sampler heap (see `bind`).
+#[cfg(windows)]
+fn spare_sampler_heap() -> Option<ID3D12DescriptorHeap> {
+    static HEAP: std::sync::OnceLock<Option<ID3D12DescriptorHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let host = crate::host::host()?;
+        const COUNT: u32 = 2048;
+        // SAFETY: a plain description; samplers written into our own heap.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: COUNT,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .inspect_err(|e| tracing::warn!(error = %e, "no spare sampler heap"))
+                .ok()?;
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            let desc = D3D12_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            for k in 0..COUNT as usize {
+                host.device.CreateSampler(
+                    &desc,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + k * step },
+                );
+            }
+            Some(heap)
+        }
+    })
+    .clone()
 }
