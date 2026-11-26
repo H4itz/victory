@@ -704,6 +704,55 @@ impl State {
         }
     }
 
+    /// In place of a draw of the title's final composite: our tonemap of
+    /// the scene it reads ([`crate::tonemap`]). True if drawn; the list's
+    /// state then needs setting again.
+    fn tonemap(&self, list: &HostList) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let Some(stage) = p.stages.iter().find(|s| s.shader.composites) else {
+            return false;
+        };
+        let reads: Vec<This> = stage
+            .translated()
+            .used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+            .filter_map(|u| {
+                match self.table_view(stage, false, ResourceType::Srv, (u.slot, u.table_offset_dwords)) {
+                    Some(View::Shader(r, _)) if r != 0 => Some(r as This),
+                    _ => None,
+                }
+            })
+            .collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            static LISTED: std::sync::Once = std::sync::Once::new();
+            LISTED.call_once(|| {
+                for u in stage.translated().used.iter().filter(|u| u.root == RootType::Table) {
+                    let r = match self.table_view(stage, false, u.kind, (u.slot, u.table_offset_dwords)) {
+                        Some(View::Shader(r, _)) | Some(View::Unordered(r, ..)) => r,
+                        _ => continue,
+                    };
+                    let Some(t) = crate::resource::host_resource(r as This) else { continue };
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    tracing::info!(
+                        kind = ?u.kind, slot = u.slot, offset = u.table_offset_dwords,
+                        format = d.Format.0, width = d.Width, height = d.Height,
+                        depth = d.DepthOrArraySize, dimension = d.Dimension.0,
+                        "the final composite reads"
+                    );
+                }
+            });
+        }
+        let Some(&target) = self.targets.first() else {
+            return false;
+        };
+        crate::tonemap::on() && crate::tonemap::draw(list, target as This, &reads)
+    }
+
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
@@ -1611,6 +1660,16 @@ impl State {
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES && !self.draws_rectangles();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        if ran && !rects && self.tonemap(list) {
+            #[cfg(feature = "diagnostics")]
+            crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
+                format!("{} (drawn by our tonemap)", self.op_text(format!("draw {vertices}x{instances}"), false, true))
+            });
+            self.continue_in(list);
+            list.count_work();
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {

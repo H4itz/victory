@@ -81,6 +81,9 @@ pub(crate) struct Shader {
     pub(crate) reads_scene: bool,
     #[cfg(windows)]
     pub(crate) reads_upscaled: bool,
+    /// It is the title's final composite ([`crate::tonemap`]).
+    #[cfg(windows)]
+    pub(crate) composites: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -229,6 +232,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 reads_upscaled: contains(bytes, crate::upscale::UPSCALED_READER)
                     && !contains(bytes, crate::upscale::NOT_UPSCALED_READER),
+                #[cfg(windows)]
+                composites: contains(bytes, crate::tonemap::PROGRAM),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

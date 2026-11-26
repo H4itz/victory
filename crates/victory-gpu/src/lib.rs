@@ -67,6 +67,8 @@ mod compose;
 #[cfg(windows)]
 mod upscale;
 #[cfg(windows)]
+mod tonemap;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod texpool;
