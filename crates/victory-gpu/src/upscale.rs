@@ -12,8 +12,20 @@
 //!
 //! Here, right before the first program that reads it (the bloom
 //! downsample), the target gets the scene as the luminance pass read it,
-//! scaled up bilinearly. No temporal anti-aliasing or sharpening, which FSR
-//! does. Only where the target is a shared-exponent stand-in
+//! scaled up bilinearly. No sharpening, which FSR does.
+//!
+//! FSR 4 also evens the picture out over frames: the title jitters its view
+//! by a fraction of a pixel each frame for it, and dithers hair, shadows and
+//! reflections, and its light leaves blocks that change from frame to frame.
+//! Without it, each frame showed all of that (RTX 3050, FSR 4's 27 programs
+//! left out: hair as grain, walls speckled). So the stand-in keeps what it
+//! made the frame before and mixes it in (`VICTORY_UPSCALE_HISTORY=<share>`,
+//! 0.7 unless set; 0: none), bounded by the scene's values around the point,
+//! the 3x3 texels it is between: what moved falls outside them and is the
+//! new frame's. There are no motion vectors here, so a moving picture is
+//! the new frame's alone, as before; one that stands still settles.
+//!
+//! Only where the target is a shared-exponent stand-in
 //! ([`crate::resource::stands_in`]) larger than the scene: the upscaler's
 //! own output (Series S); the Series X profile does not take this path. And
 //! only while no compute program has written the target through unordered
@@ -40,6 +52,19 @@ pub(crate) const UPSCALED_READER: &[u8] = b"CS_BloomDownsampleKaris";
 pub(crate) const NOT_UPSCALED_READER: &[u8] = b"TAAHistory";
 /// Their view of the upscaled scene.
 pub(crate) const UPSCALED: (u8, u32) = (1, 8);
+
+/// How much of the frame before is kept (`VICTORY_UPSCALE_HISTORY`).
+fn history_share() -> f32 {
+    static SHARE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| parse_share(&std::env::var("VICTORY_UPSCALE_HISTORY").unwrap_or_default()))
+}
+
+fn parse_share(set: &str) -> f32 {
+    match set.trim() {
+        "" => 0.7,
+        v => v.parse::<f32>().ok().filter(|v| v.is_finite()).map_or(0.7, |v| v.clamp(0.0, 0.95)),
+    }
+}
 
 /// The scene's title texture, as last read by [`SCENE_READER`].
 static LAST_SCENE: AtomicUsize = AtomicUsize::new(0);
@@ -68,9 +93,11 @@ pub(crate) fn note_scene(scene: This) {
 }
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=1), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, visibility=SHADER_VISIBILITY_PIXEL)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=1, b0, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, visibility=SHADER_VISIBILITY_PIXEL)"
 Texture2D<float4> scene : register(t0);
+Texture2D<float4> history : register(t1);
 SamplerState smooth_ : register(s0);
+cbuffer Set : register(b0) { float share; };
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
@@ -81,12 +108,40 @@ V vs(uint id : SV_VertexID) {
 }
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
-    return float4(scene.SampleLevel(smooth_, v.uv, 0).rgb, 1);
+    float3 now = scene.SampleLevel(smooth_, v.uv, 0).rgb;
+    if (share <= 0.0) return float4(now, 1);
+    uint w, h;
+    scene.GetDimensions(w, h);
+    float2 size = float2(w, h);
+    // The texels around: their centres, read through the linear sampler.
+    float2 c = (floor(v.uv * size) + 0.5) / size;
+    float3 lo = now, hi = now;
+    [unroll] for (int y = -1; y <= 1; y++) {
+        [unroll] for (int x = -1; x <= 1; x++) {
+            float3 t = scene.SampleLevel(smooth_, c + float2(x, y) / size, 0).rgb;
+            lo = min(lo, t);
+            hi = max(hi, t);
+        }
+    }
+    float3 was = history.Load(int3(int2(v.at.xy), 0)).rgb;
+    if (any(isnan(was)) || any(isinf(was))) was = now;
+    return float4(lerp(now, clamp(was, lo, hi), share), 1);
 }
 "#;
 
-/// Views, used in turn: more than the upscales of every list in flight.
+/// Views, used in turn two at a time (the scene, what was made the frame
+/// before): more than the upscales of every list in flight.
 const SLOTS: u32 = 64;
+
+/// What the stand-in made the frame before, for the next to mix in: a
+/// texture of the target's size and format, kept readable by shaders
+/// between upscales (each upscale copies into it and gives it back so,
+/// whatever order lists are recorded in).
+struct History {
+    texture: ID3D12Resource,
+    size: (u64, u32),
+    format: i32,
+}
 
 struct Upscaler {
     root: ID3D12RootSignature,
@@ -96,6 +151,7 @@ struct Upscaler {
     views: ID3D12DescriptorHeap,
     step: u32,
     next: AtomicU32,
+    history: std::sync::Mutex<Option<History>>,
 }
 // SAFETY: D3D12 objects are free-threaded; blobs are only read.
 unsafe impl Send for Upscaler {}
@@ -148,11 +204,65 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Upscaler> {
             views,
             step: device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             next: AtomicU32::new(0),
+            history: std::sync::Mutex::new(None),
         })
     }
 }
 
 impl Upscaler {
+    /// The texture of what was made the frame before for a target like
+    /// `like`, and whether it holds nothing yet (made now, or never copied
+    /// into). None if it cannot be made.
+    fn history(&self, device: &ID3D12Device, like: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, bool)> {
+        let mut kept = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let size = (like.Width, like.Height);
+        if let Some(h) = kept.as_ref().filter(|h| h.size == size && h.format == like.Format.0) {
+            return Some((h.texture.clone(), false));
+        }
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: like.Width,
+            Height: like.Height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: like.Format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: a complete description; the out pointer is ours.
+        let made = unsafe {
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                None,
+                &mut texture,
+            )
+        };
+        let Some(texture) = made.ok().and(texture) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("the stand-in upscale keeps no frame before: no texture for it"));
+            return None;
+        };
+        tracing::info!(
+            share = history_share(),
+            width = like.Width,
+            height = like.Height,
+            "the stand-in upscale mixes in the frame before (VICTORY_UPSCALE_HISTORY=0 for none)"
+        );
+        // (The first upscale after it was made has nothing to mix in.)
+        *kept = Some(History { texture: texture.clone(), size, format: like.Format.0 });
+        Some((texture, true))
+    }
+
     fn pipeline(&self, device: &ID3D12Device, format: DXGI_FORMAT) -> Option<ID3D12PipelineState> {
         let mut made = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, p)) = made.iter().find(|(f, _)| *f == format.0) {
@@ -264,7 +374,13 @@ pub(crate) fn fill(list: &HostList, target: This) -> bool {
     // the title's).
     let format = crate::resource::view_format(scene)
         .map_or(s.Format, |f| DXGI_FORMAT(crate::resource::pc_format(f) as i32));
-    let slot = u.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
+    let share = history_share();
+    let history = (share > 0.0).then(|| u.history(&host.device, &d)).flatten();
+    let mix = match &history {
+        Some((_, false)) => share,
+        _ => 0.0,
+    };
+    let slot = (u.next.fetch_add(1, Ordering::Relaxed) % (SLOTS / 2)) * 2;
     let l = &list.list;
     // SAFETY: an open list; the view is made in a slot no list in flight
     // reads; live textures in the states the draw needs.
@@ -290,12 +406,30 @@ pub(crate) fn fill(list: &HostList, target: This) -> bool {
             }),
             cpu,
         );
+        // What was made the frame before (a null view without it: the
+        // shader then does not read it).
+        host.device.CreateShaderResourceView(
+            history.as_ref().map(|(h, _)| h),
+            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: d.Format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MipLevels: 1,
+                        ..Default::default()
+                    },
+                },
+            }),
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + u.step as usize },
+        );
         let rtv = host.rtv(Some(to), None);
         l.OMSetRenderTargets(1, Some(&rtv), false, None);
         l.SetDescriptorHeaps(&[Some(u.views.clone())]);
         l.SetGraphicsRootSignature(&u.root);
         l.SetPipelineState(&pso);
         l.SetGraphicsRootDescriptorTable(0, gpu);
+        l.SetGraphicsRoot32BitConstant(1, mix.to_bits(), 0);
         l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         l.RSSetViewports(&[D3D12_VIEWPORT {
             Width: d.Width as f32,
@@ -311,7 +445,42 @@ pub(crate) fn fill(list: &HostList, target: This) -> bool {
         }]);
         l.DrawInstanced(3, 1, 0, 0);
     }
+    if let Some((h, _)) = &history {
+        const COPY_SOURCE: u32 = 0x800;
+        crate::list::ensure_state(list, target, COPY_SOURCE);
+        let location = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer; the location never releases it.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let (read, copied) = (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        // SAFETY: an open list; the history is readable between upscales
+        // and the target is a copy source now; both live (the list keeps the
+        // history).
+        unsafe {
+            l.ResourceBarrier(&[crate::host::transition(h, read, copied)]);
+            l.CopyTextureRegion(&location(h), 0, 0, 0, &location(to), None);
+            l.ResourceBarrier(&[crate::host::transition(h, copied, read)]);
+        }
+        list.keep(h);
+    }
     list.keep(&u.views);
     list.keep(&pso);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_share;
+
+    #[test]
+    fn the_share_of_the_frame_before() {
+        assert_eq!(parse_share(""), 0.7);
+        assert_eq!(parse_share("0"), 0.0);
+        assert_eq!(parse_share(" 0.5 "), 0.5);
+        assert_eq!(parse_share("2"), 0.95);
+        assert_eq!(parse_share("-1"), 0.0);
+        assert_eq!(parse_share("nan"), 0.7);
+    }
 }

@@ -30,6 +30,14 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
+//! `VICTORY_AMBIENT_MOST=<multiple>` (4 unless set): what the title's
+//! program left is kept up to that multiple of the estimate, colour by
+//! colour. The blocks of other memory are of any colour and brightness; a
+//! bound on their brightness alone let a blue or red block through at many
+//! times the estimate in that colour, and without a temporal upscaler
+//! (FSR 4 left out on NVIDIA) nothing evens them out from frame to frame.
+//! 1 or less: the estimate alone, no blocks (nor the title's sky light).
+//!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
@@ -110,6 +118,21 @@ fn air() -> f32 {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
+}
+
+/// How far above the estimate what the title's program left may stay, as a
+/// multiple of it per colour (`VICTORY_AMBIENT_MOST`; 4 unless set).
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let most = parse_most(&std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default());
+        tracing::info!(most, "the indirect light the title left, kept up to this multiple of the estimate");
+        most
+    })
+}
+
+fn parse_most(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(4.0)
 }
 
 /// Strength and radius of the creases' shade.
@@ -322,10 +345,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
+    // outdoors, not the blocks of other memory. Colour by colour: a block
+    // as bright as the estimate may be all blue.
+    was = min(was, found * most);
     light[p] = pack(max(was, found));
 }
 #endif
@@ -459,7 +481,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -509,6 +531,11 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert_eq!(parse_most(""), 4.0);
+        assert_eq!(parse_most(" 1.5 "), 1.5);
+        assert_eq!(parse_most("0"), 0.0);
+        assert_eq!(parse_most("-1"), 4.0);
+        assert_eq!(parse_most("inf"), 4.0);
     }
 
     #[test]

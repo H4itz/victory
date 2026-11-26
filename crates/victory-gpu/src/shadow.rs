@@ -424,6 +424,24 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Said too: on a card of 6 GB the limit (512 MB) was full of
+        // copies under 1 MiB, and 220 MB a frame of larger ones were
+        // looked through on the CPU with no line naming them.
+        static OVER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let n = OVER[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = OVER[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n <= 16 || n.is_multiple_of(64) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB \
+                 (VICTORY_CARD_BUFFERS_MB); {} buffers over that limit so far ({} MB), frame {}",
+                size >> 10,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most >> 20,
+                n,
+                bytes >> 20,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
