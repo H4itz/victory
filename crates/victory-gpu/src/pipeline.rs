@@ -522,15 +522,37 @@ fn is_hash(token: &str) -> bool {
     token.len() == 16 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The program's name as its container holds it (the word before
+/// `_Wrapped`), or empty.
+#[cfg(windows)]
+fn program_name(bytes: &[u8]) -> String {
+    const END: &[u8] = b"_Wrapped";
+    let Some(at) = bytes.windows(END.len()).position(|w| w == END) else {
+        return String::new();
+    };
+    let before = &bytes[at.saturating_sub(100)..at];
+    let name = before
+        .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        .next()
+        .unwrap_or_default();
+    String::from_utf8_lossy(name).into_owned()
+}
+
 /// Whether the container `bytes` of hash `hash` is one
-/// [`skip_tokens`] names: once, when the shader is first seen.
+/// [`skip_tokens`] names: once, when the shader is first seen. In a timing
+/// run (`VICTORY_GPU_TIMING`) every program is logged with its name, for
+/// the hashes the timing names.
 #[cfg(windows)]
 fn skip_match(bytes: &[u8], hash: &str) -> bool {
+    static TIMING: OnceLock<bool> = OnceLock::new();
+    if *TIMING.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some()) {
+        tracing::info!(hash, name = program_name(bytes), "program");
+    }
     let found = skip_tokens()
         .iter()
         .find(|t| if is_hash(t) { t.as_str() == hash } else { contains(bytes, t.as_bytes()) });
     if let Some(token) = found {
-        tracing::info!(hash, token = token.as_str(), "a program left out (VICTORY_SKIP_PIPELINES)");
+        tracing::info!(hash, token = token.as_str(), name = program_name(bytes), "a program left out (VICTORY_SKIP_PIPELINES)");
     }
     found.is_some()
 }
