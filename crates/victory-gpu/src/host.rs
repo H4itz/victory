@@ -127,6 +127,56 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// With each frame-rate line, in every build: where memory stands. An RTX
+/// 3050 laptop with 16 GB of RAM ended its runs outdoors when the memory
+/// the PC shares with the card ran out (213,000 upload buffers refused in
+/// four minutes, then the device was lost), and no line showed it coming:
+/// both of the system's groups for the card, the PC's free memory, this
+/// process's, and what of it is ours (host copies of title memory, the
+/// windows among them, the lists' upload memory).
+fn memory_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mb = |b: u64| b >> 20;
+    let [own_budget, own, shared_budget, shared] = host().and_then(|h| h.video_memory()).unwrap_or_default();
+    let (private, working) = process_memory();
+    let copies = crate::shadow::memory();
+    tracing::info!(
+        "memory now: the card's own {} of {} MB; the PC's shared with the card {} of {} MB; the PC's free memory {} MB; \
+         this process {} MB private, {} MB of it in memory; host copies of title memory {} ({} MB), of them windows {} ({} MB); \
+         the lists' upload chunks {} ({} MB, {} MB of them kept spare), other upload buffers {} ({} MB); host lists {}",
+        mb(own),
+        mb(own_budget),
+        mb(shared),
+        mb(shared_budget),
+        mb(available_physical_ram().unwrap_or(0)),
+        mb(private),
+        mb(working),
+        copies[0],
+        mb(copies[1]),
+        copies[2],
+        mb(copies[3]),
+        ALIVE[1].load(Relaxed),
+        mb(ALIVE[2].load(Relaxed)),
+        mb(ALIVE[4].load(Relaxed)),
+        ALIVE[6].load(Relaxed),
+        mb(ALIVE[7].load(Relaxed)),
+        ALIVE[0].load(Relaxed),
+    );
+}
+
+/// This process's private bytes and its working set.
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
 /// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
 pub(crate) fn available_physical_ram() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -8886,6 +8936,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            memory_line();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
