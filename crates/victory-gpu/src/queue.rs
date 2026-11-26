@@ -644,6 +644,32 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
+/// The second plane's first resource, after the first plane's description
+/// (whose size the title's runtime does not tell): the next description
+/// with the same frame token and a believable resource list.
+#[cfg(windows)]
+fn second_plane(first: *const Plane) -> Option<This> {
+    // SAFETY: the title passes plane descriptions.
+    let token = unsafe { (*first).token };
+    (24..=256).step_by(8).find_map(|offset| {
+        let mut words = [0u64; 3];
+        // SAFETY: plain words.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 24) };
+        if !crate::host::read_into(first.cast::<u8>().wrapping_add(offset), bytes)
+            || words[0] != token
+            || !(1..=4).contains(&(words[1] as u32))
+            || words[2] < 0x10000
+            || words[2] % 8 != 0
+        {
+            return None;
+        }
+        let mut resource = [0u8; 8];
+        crate::host::read_into(words[2] as *const u8, &mut resource)
+            .then(|| u64::from_le_bytes(resource) as This)
+            .filter(|r| crate::resource::is_texture(*r))
+    })
+}
+
 /// The start of a present plane: frame token, then the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
@@ -924,9 +950,32 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    // A second plane (Series S: the interface, over the scene; the intro
+    // films and the menus are only there): put over the first when shown.
+    #[cfg(windows)]
+    let over: Option<This> = if planes > 1 && !plane_parameters.is_null() {
+        let found = second_plane(plane_parameters);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(planes, found = found.is_some(), "several planes presented"));
+        found
+    } else {
+        None
+    };
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
+        // The state the lists recorded so far leave a texture in (the next
+        // frame's, recorded before this is shown, go on from there).
+        let held = |resource: This| {
+            crate::resource::host_copy(resource).map(|copy| {
+                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                crate::resource::host_transition(resource, state);
+                // (Lists not translated yet leave it in no state yet: the
+                // one it is in when its turn in the line comes.)
+                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+                (copy, state)
+            })
+        };
         let texture = if planes > 0
             // SAFETY: the title passes `planes` plane descriptions.
             && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -935,21 +984,13 @@ extern "system" fn present(
         {
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
-            // The state the lists recorded so far leave it in (the next
-            // frame's, recorded before this is shown, go on from there).
-            crate::resource::host_copy(resource).map(|copy| {
-                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-                crate::resource::host_transition(resource, state);
-                // (Lists not translated yet leave it in no state yet: the
-                // one it is in when its turn in the line comes.)
-                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
-                (resource as usize, copy, state)
-            })
+            held(resource).map(|(copy, state)| (resource as usize, copy, state))
         } else {
             None
         };
+        let over = over.and_then(held);
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), over, Shown { frame, resource });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -969,8 +1010,16 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        let over = over.and_then(|r| {
+            let texture = crate::resource::host_resource(r)?;
+            let state = crate::resource::host_transition(r, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+            Some((r, texture, state))
+        });
+        show(texture, state, over.map(|(_, t, s)| (t, s)), Shown { frame, resource: resource as usize });
         crate::resource::host_transition(resource, state);
+        if let Some((r, _, s)) = over {
+            crate::resource::host_transition(r, s);
+        }
         let _ = host;
     }
     #[cfg(not(windows))]
@@ -1001,13 +1050,19 @@ struct Shown {
     resource: usize,
 }
 
-/// Shows `texture`, in host state `state`, in our window.
+/// Shows `texture`, in host state `state`, in our window, with `over` (a
+/// second plane, in its state) put over it.
 #[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    over: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let shown = host.present(texture, state, over, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

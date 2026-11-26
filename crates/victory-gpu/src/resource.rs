@@ -2379,6 +2379,17 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Whether `this`, an address read from title memory, is a resource object
+/// of ours with a host texture (a second presented plane is found so).
+#[cfg(windows)]
+pub(crate) fn is_texture(this: This) -> bool {
+    let mut vtable = [0u8; 8];
+    !this.is_null()
+        && crate::host::read_into(this.cast::<u8>(), &mut vtable)
+        && u64::from_le_bytes(vtable) == RESOURCE_FUNCTIONS.0.as_ptr() as u64
+        && host_copy(this).is_some()
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {

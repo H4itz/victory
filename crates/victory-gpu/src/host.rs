@@ -8801,16 +8801,30 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
+    /// as frame `frame` (saved if captures are on), with `over` (a second
+    /// presented plane, in its state) put over it. `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
+        // Two planes are drawn together into an 8-bit picture of the scene's
+        // size, or of the screen's where the scene is smaller.
+        let format = if over.is_some() { Some(DXGI_FORMAT_R8G8B8A8_UNORM) } else { swap_format(desc.Format) };
+        let Some(format) = format else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (width, height) = if over.is_some() && desc.Height < 1080 {
+            (1920, 1080)
+        } else {
+            (desc.Width as u32, desc.Height)
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -8879,35 +8893,68 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
-            #[cfg(feature = "diagnostics")]
-            let watched = crate::popwatch::take(&self.device, list, texture);
-            #[cfg(feature = "diagnostics")]
-            p.panel.draw(self, copy, &back, (width, height), format);
+            let (capture, probe, watched);
+            if let Some((over, over_state)) = over {
+                // The second plane over the first, each scaled to the screen
+                // (`crate::compose`).
+                let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                let mut into = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)];
+                let mut out = Vec::new();
+                for (t, s) in [(texture, state), (over, D3D12_RESOURCE_STATES(over_state as i32))] {
+                    if s != read {
+                        into.push(transition(t, s, read));
+                        out.push(transition(t, read, s));
+                    }
+                }
+                list.ResourceBarrier(&into);
+                let view = |t: &ID3D12Resource| swap_format(t.GetDesc().Format);
+                let planes = [view(texture).map(|f| (texture, f)), view(over).map(|f| (over, f))];
+                crate::compose::record(self, list, planes, &back, (width, height, format));
+                #[cfg(feature = "diagnostics")]
+                {
+                    list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    capture = crate::capture::wanted(frame)
+                        .then(|| crate::capture::read_back(&self.device, list, &back))
+                        .flatten();
+                    probe = None;
+                    watched = None;
+                    out.push(transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT));
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                out.push(transition(&back, target, D3D12_RESOURCE_STATE_PRESENT));
+                list.ResourceBarrier(&out);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+                #[cfg(feature = "diagnostics")]
+                {
+                    capture = crate::capture::wanted(frame)
+                        .then(|| crate::capture::read_back(&self.device, list, texture))
+                        .flatten();
+                    probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+                    watched = crate::popwatch::take(&self.device, list, texture);
+                    p.panel.draw(self, copy, &back, (width, height), format);
+                }
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
             copy.close();
             let flown = match slot {
                 Some(i) => {
