@@ -1265,6 +1265,50 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// `VICTORY_TEXTURE_MAX=<pixels>`: textures the title places in memory and
+/// fills are kept on the card from the first level whose sides are at most
+/// that many texels (0 or unset: no limit). Only with held levels
+/// ([`held_only`]), whose host copies start at a level already: a 6 GB card
+/// had no room for the world's textures (RTX 3050, Series S), the levels a
+/// view asks for above the limit are left out as levels the title does not
+/// hold are, and shaders sample the largest one kept.
+#[cfg(windows)]
+fn texture_max() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let max = std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if max > 0 {
+            tracing::info!(max, held_levels = held_only(), "textures kept on the card at most this many texels a side");
+        }
+        max
+    })
+}
+
+/// The first level of `desc` within [`texture_max`] (0: no limit, or the
+/// whole texture is within it).
+#[cfg(windows)]
+fn cap_level(desc: &ResourceDesc) -> u32 {
+    level_within(desc, texture_max())
+}
+
+/// The first level of `desc` whose sides are at most `max` texels, or its
+/// last level (0 for `max` 0: no limit).
+fn level_within(desc: &ResourceDesc, max: u64) -> u32 {
+    if max == 0 || desc.mip_levels <= 1 {
+        return 0;
+    }
+    let mut level = 0;
+    while level + 1 < u32::from(desc.mip_levels)
+        && ((desc.width >> level).max(u64::from(desc.height) >> level)) > max
+    {
+        level += 1;
+    }
+    level
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
@@ -1353,6 +1397,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
+    // Never larger than the size limit (`VICTORY_TEXTURE_MAX`).
+    let first = first.max(cap_level(&r.desc));
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
         return;
     }
@@ -1580,7 +1626,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
-            let first = wanted.min(viewed);
+            // Not above the size limit (`VICTORY_TEXTURE_MAX`), whatever
+            // the views show.
+            let cap = cap_level(&r.desc);
+            let first = match wanted.min(viewed) {
+                u32::MAX if cap > 0 => cap,
+                first => first.max(cap),
+            };
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
             }
@@ -4576,5 +4628,32 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// `VICTORY_TEXTURE_MAX`: the first level within the limit, the last
+    /// level at most, nothing without a limit.
+    #[test]
+    fn the_size_limit_picks_the_first_level_within_it() {
+        let desc = |width: u64, height: u32, mip_levels: u16| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels,
+            format: 98,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        assert_eq!(level_within(&desc(4096, 4096, 13), 0), 0);
+        assert_eq!(level_within(&desc(4096, 4096, 13), 1024), 2);
+        assert_eq!(level_within(&desc(4096, 2048, 13), 512), 3);
+        assert_eq!(level_within(&desc(1024, 1024, 11), 1024), 0);
+        assert_eq!(level_within(&desc(2000, 600, 11), 1024), 1);
+        // No level that small: the last one.
+        assert_eq!(level_within(&desc(4096, 4096, 3), 256), 2);
+        assert_eq!(level_within(&desc(4096, 4096, 1), 256), 0);
     }
 }
