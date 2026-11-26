@@ -1472,6 +1472,7 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        self.note_scene(p);
         if !self.bind(list, p, false) {
             return false;
         }
@@ -3120,6 +3121,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if self.upscale(list, p) {
+            // Our draw set its own state on the list: the title's again.
+            self.replay(list);
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3163,6 +3168,46 @@ impl State {
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+        }
+    }
+
+    /// The view at table place `(slot, offset)` of `stage`'s, as bound for
+    /// draws or dispatches.
+    fn table_view(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        kind: ResourceType,
+        (slot, offset): (u8, u32),
+    ) -> Option<View> {
+        stage.translated().used.iter().find(|u| {
+            u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        })?;
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return None;
+        };
+        crate::descriptor::view(table + u64::from(offset) * 4)
+    }
+
+    /// Before a dispatch of `p`: the upscaled scene it reads, filled where no
+    /// upscaler ran ([`crate::upscale`]). True if anything was recorded.
+    fn upscale(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.reads_upscaled) else {
+            return false;
+        };
+        match self.table_view(stage, true, ResourceType::Srv, crate::upscale::UPSCALED) {
+            Some(View::Shader(r, _)) => crate::upscale::fill(list, r as This),
+            _ => false,
+        }
+    }
+
+    /// Before a draw of `p`: the scene, if it is the program that reads it
+    /// for exposure ([`crate::upscale`]).
+    fn note_scene(&self, p: &HostPipeline) {
+        for stage in p.stages.iter().filter(|s| s.shader.reads_scene) {
+            if let Some(View::Shader(r, _)) = self.table_view(stage, false, ResourceType::Srv, crate::upscale::SCENE) {
+                crate::upscale::note_scene(r as This);
+            }
         }
     }
 
@@ -4658,6 +4703,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // An upscaler that runs writes its output so ([`crate::upscale`]).
+            crate::upscale::note_unordered(*resource as This);
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.

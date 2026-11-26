@@ -64,8 +64,20 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// It reads the scene for exposure, or first reads the upscaled scene
+    /// ([`crate::upscale`]).
+    #[cfg(windows)]
+    pub(crate) reads_scene: bool,
+    #[cfg(windows)]
+    pub(crate) reads_upscaled: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Whether `bytes` hold `name` (a program's name in its container).
+#[cfg(windows)]
+fn contains(bytes: &[u8], name: &[u8]) -> bool {
+    bytes.windows(name.len()).any(|w| w == name)
 }
 
 impl std::fmt::Debug for Shader {
@@ -116,6 +128,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                reads_scene: contains(bytes, crate::upscale::SCENE_READER),
+                #[cfg(windows)]
+                reads_upscaled: contains(bytes, crate::upscale::UPSCALED_READER)
+                    && !contains(bytes, crate::upscale::NOT_UPSCALED_READER),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
