@@ -70,6 +70,10 @@ pub(crate) struct Shader {
     pub(crate) reads_scene: bool,
     #[cfg(windows)]
     pub(crate) reads_upscaled: bool,
+    /// It is left out (`VICTORY_SKIP_PIPELINES` names its hash or its
+    /// program).
+    #[cfg(windows)]
+    pub(crate) skip: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -133,6 +137,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 reads_upscaled: contains(bytes, crate::upscale::UPSCALED_READER)
                     && !contains(bytes, crate::upscale::NOT_UPSCALED_READER),
+                #[cfg(windows)]
+                skip: skip_match(bytes, &full.to_hex()[..16]),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -487,44 +493,57 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+/// `VICTORY_SKIP_PIPELINES`: comma-separated shader hashes as printed in the
+/// pipeline diagnostics (16 hex digits), or the start of program names as
+/// their containers hold them (`CS_TransmissionVolumetrics`, say); `none`
+/// or empty: nothing. The draws and dispatches of a pipeline with such a
+/// shader are left out, in every build (to take passes the card cannot
+/// afford out of the frame; what they write stays as it was).
+#[cfg(windows)]
+fn skip_tokens() -> &'static [String] {
+    static TOKENS: OnceLock<Vec<String>> = OnceLock::new();
+    TOKENS.get_or_init(|| parse_skip(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default()))
+}
+
+/// [`skip_tokens`] from the setting's value: hashes in lower case, names as
+/// they are, nothing for `none`.
+#[cfg(windows)]
+fn parse_skip(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
-        .filter(|hash| !hash.is_empty())
-        .filter_map(|hash| {
-            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                Some(hash.to_ascii_lowercase())
-            } else {
-                tracing::warn!(
-                    hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
-                );
-                None
-            }
-        })
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("none"))
+        .map(|t| if is_hash(t) { t.to_ascii_lowercase() } else { t.to_owned() })
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
-    if hashes.is_empty() {
-        return None;
+#[cfg(windows)]
+fn is_hash(token: &str) -> bool {
+    token.len() == 16 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether the container `bytes` of hash `hash` is one
+/// [`skip_tokens`] names: once, when the shader is first seen.
+#[cfg(windows)]
+fn skip_match(bytes: &[u8], hash: &str) -> bool {
+    let found = skip_tokens()
+        .iter()
+        .find(|t| if is_hash(t) { t.as_str() == hash } else { contains(bytes, t.as_bytes()) });
+    if let Some(token) = found {
+        tracing::info!(hash, token = token.as_str(), "a program left out (VICTORY_SKIP_PIPELINES)");
     }
+    found.is_some()
+}
+
+#[cfg(windows)]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| shader.skip)
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -810,14 +829,16 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
-    fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+    fn skip_takes_full_hashes_and_program_names() {
+        assert!(super::parse_skip(" , ").is_empty());
+        assert!(super::parse_skip("none").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
-            ["0123456789abcdef", "0011223344556677"]
+            super::parse_skip(" 0123456789ABCDEF, CS_TransmissionVolumetrics, 0011223344556677,"),
+            ["0123456789abcdef", "CS_TransmissionVolumetrics", "0011223344556677"]
         );
+        assert!(super::is_hash("0123456789abcdef") && !super::is_hash("0123456789abcde"));
     }
 
     use super::*;
