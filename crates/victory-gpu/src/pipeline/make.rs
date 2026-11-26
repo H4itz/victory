@@ -34,6 +34,10 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
+    /// A worker has begun it; it is (also) on the queue of pipelines a
+    /// draw waits for.
+    taken: AtomicBool,
+    urgent: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// Its worker was lost to it: it will not be made.
     lost: AtomicBool,
@@ -64,6 +68,8 @@ impl Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
+            taken: AtomicBool::new(false),
+            urgent: AtomicBool::new(false),
             made: OnceLock::new(),
             lost: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -125,7 +131,7 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
+        start(p, true);
         if p.lost.load(Ordering::Relaxed) {
             return None;
         }
@@ -140,11 +146,19 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     made
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
+/// Queues `p` for the workers, once; `urgent` if a draw waits for it, which
+/// also moves one queued early ahead of the rest.
+fn start(p: &Arc<Pending>, urgent: bool) {
     if !p.queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        queue(p.clone());
+        if urgent {
+            p.urgent.store(true, Ordering::Relaxed);
+        }
+        queue(p.clone(), urgent);
+    } else if urgent && !p.taken.load(Ordering::Relaxed) && !p.urgent.swap(true, Ordering::Relaxed) {
+        // Queued early and not begun: a second entry ahead (the worker that
+        // takes it second skips it).
+        queue(p.clone(), true);
     }
 }
 
@@ -153,7 +167,7 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, false);
     }
 }
 
@@ -181,9 +195,44 @@ fn wait(p: &Pending, frame: u64) {
     waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// What the workers take from: the ordinary pipelines, the screen passes.
-static RECEIVER: [OnceLock<Mutex<std::sync::mpsc::Receiver<Arc<Pending>>>>; 2] =
-    [const { OnceLock::new() }; 2];
+/// What the workers take from, for the ordinary pipelines and for the
+/// screen passes: those a draw waits for, then those started early (an
+/// earlier run drew with them). In one queue, the pipelines of the place
+/// the title shows waited behind its whole list from the last run: a
+/// world's lighting pipelines came 8 minutes after their first draw on an
+/// RTX 3050 laptop.
+struct Queues {
+    urgent: std::collections::VecDeque<Arc<Pending>>,
+    early: std::collections::VecDeque<Arc<Pending>>,
+}
+
+static QUEUES: [(Mutex<Queues>, Condvar); 2] = [const {
+    (
+        Mutex::new(Queues {
+            urgent: std::collections::VecDeque::new(),
+            early: std::collections::VecDeque::new(),
+        }),
+        Condvar::new(),
+    )
+}; 2];
+
+/// Workers running, by kind.
+static WORKERS: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+/// The next pipeline for a worker of the kind (`screen`), waiting for one.
+fn next(screen: bool) -> Arc<Pending> {
+    let (lock, ready) = &QUEUES[usize::from(screen)];
+    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        while let Some(p) = q.urgent.pop_front().or_else(|| q.early.pop_front()) {
+            if !p.taken.swap(true, Ordering::Relaxed) {
+                return p;
+            }
+        }
+        q = ready.wait(q).unwrap_or_else(|e| e.into_inner());
+    }
+}
 
 /// What the workers (by thread) are making.
 static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
@@ -199,10 +248,8 @@ fn worker(i: usize, screen: bool) {
                 use windows::Win32::System::Threading::*;
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             }
-            let Some(receiver) = RECEIVER[usize::from(screen)].get() else { return };
             loop {
-                let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok(p) = next else { return };
+                let p = next(screen);
                 // SAFETY: a plain call.
                 let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((id, p.clone()));
@@ -215,8 +262,11 @@ fn worker(i: usize, screen: bool) {
                 }
             }
         });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "no pipeline worker");
+    match spawned {
+        Ok(_) => {
+            WORKERS[usize::from(screen)].fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
     }
 }
 
@@ -240,14 +290,12 @@ pub(super) fn worker_lost(id: u32) {
 }
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8, and two
-/// for screen passes), started on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: [OnceLock<std::sync::mpsc::Sender<Arc<Pending>>>; 2] =
-        [const { OnceLock::new() }; 2];
+/// for screen passes), started on first use; ahead of those started early
+/// if `urgent`.
+fn queue(p: Arc<Pending>, urgent: bool) {
+    static STARTED: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
     let screen = p.screen;
-    let sender = SENDER[usize::from(screen)].get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let _ = RECEIVER[usize::from(screen)].set(Mutex::new(receiver));
+    STARTED[usize::from(screen)].call_once(|| {
         let workers = if screen {
             2
         } else {
@@ -256,13 +304,24 @@ fn queue(p: Arc<Pending>) {
         for i in 0..workers {
             worker(i + if screen { 50 } else { 0 }, screen);
         }
-        sender
     });
-    if let Err(e) = sender.send(p) {
+    if WORKERS[usize::from(screen)].load(Ordering::Relaxed) == 0 {
         // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
+        if !p.taken.swap(true, Ordering::Relaxed) {
+            p.make();
+            WAITING.fetch_sub(1, Ordering::Relaxed);
+        }
+        return;
     }
+    let (lock, ready) = &QUEUES[usize::from(screen)];
+    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if urgent {
+        q.urgent.push_back(p);
+    } else {
+        q.early.push_back(p);
+    }
+    drop(q);
+    ready.notify_one();
 }
 
 /// The most pipelines waiting at once since the workers last ran out.

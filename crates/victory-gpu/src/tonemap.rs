@@ -34,6 +34,8 @@ use crate::object::This;
 
 /// The title's final composite, by the start of its name.
 pub(crate) const PROGRAM: &[u8] = b"PS_Composite_";
+/// Its pixel shader, by hash (Series 1.0.2.1), should the name not be found.
+pub(crate) const KNOWN: &[&str] = &["7c649c422f6208e4"];
 
 /// Knobs: key, bloom, low share, high share.
 fn knobs() -> Option<[f32; 4]> {

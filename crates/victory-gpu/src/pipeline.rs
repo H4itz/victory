@@ -233,7 +233,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 reads_upscaled: contains(bytes, crate::upscale::UPSCALED_READER)
                     && !contains(bytes, crate::upscale::NOT_UPSCALED_READER),
                 #[cfg(windows)]
-                composites: contains(bytes, crate::tonemap::PROGRAM),
+                composites: {
+                    let named = contains(bytes, crate::tonemap::PROGRAM);
+                    let known = crate::tonemap::KNOWN.contains(&&full.to_hex()[..16]);
+                    if named || known {
+                        tracing::info!(hash = &full.to_hex()[..16], named, known, stage, "the title's final composite");
+                    }
+                    named || known
+                },
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -271,6 +278,7 @@ impl Shader {
                 if done.is_err()
                     || std::env::var("VICTORY_SHADER_HASHES")
                         .is_ok_and(|l| l.split(',').any(|h| h == self.hash))
+                    || dump_more(self)
                 {
                     dump(self);
                 }
@@ -313,6 +321,32 @@ fn dump(shader: &Shader) {
     } else if let Err(error) = std::fs::write(&path, &shader.container) {
         tracing::warn!(%error, "shader not saved");
     }
+}
+
+/// Diagnostics: `VICTORY_SHADER_DUMP_MORE=<tokens>` (with
+/// `VICTORY_SHADER_DUMP`) also saves the shaders that translate and whose
+/// container names one of the comma-separated tokens; the token `wave64`
+/// names every wave64 compute program run on a host without 64-lane waves
+/// (those translated with the halves of a console wave apart).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_more(shader: &Shader) -> bool {
+    static TOKENS: OnceLock<Vec<String>> = OnceLock::new();
+    let tokens = TOKENS.get_or_init(|| {
+        std::env::var("VICTORY_SHADER_DUMP_MORE")
+            .unwrap_or_default()
+            .split(',')
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+    tokens.iter().any(|t| {
+        if t == "wave64" {
+            let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+            victory_shader::emit::revision(&shader.container, target) != 0
+        } else {
+            contains(&shader.container, t.as_bytes())
+        }
+    })
 }
 
 /// As [`dump`], for the shaders of a pipeline the host refused: they

@@ -714,6 +714,17 @@ impl State {
         let Some(stage) = p.stages.iter().find(|s| s.shader.composites) else {
             return false;
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
+                tracing::info!(
+                    targets = self.targets.len(),
+                    on = crate::tonemap::on(),
+                    "a draw of the title's final composite"
+                );
+            }
+        }
         let reads: Vec<This> = stage
             .translated()
             .used
@@ -1412,6 +1423,41 @@ impl State {
         }) {
             fresh.insert(u.slot);
         }
+        // With `VICTORY_NV_TABLES`, a table of shader resources holding a
+        // slot the title has put another view in since a draw read it is
+        // made afresh too (upstream's reason to make them all afresh: a later
+        // write of the title's changed what a recorded draw sampled, and the
+        // final composite of an RTX 3050 run read none of the scene). Only
+        // while a quarter of the dynamic slots stays free: past that it
+        // reads the title's slots as before, and constants keep their room.
+        let mut snapshots = Slots::default();
+        if nv {
+            for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Srv) {
+                if fresh.contains(u.slot) || snapshots.contains(u.slot) {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let Some(heap) = self.heap_of(table) else {
+                    continue;
+                };
+                let (Some(host), Some(base)) = (heap.host(), heap.index(table)) else {
+                    continue;
+                };
+                let n = used
+                    .iter()
+                    .filter(tables)
+                    .filter(|e| e.slot == u.slot)
+                    .map(|e| e.table_offset_dwords / 8 + 1)
+                    .max()
+                    .unwrap_or(1);
+                if n < LARGE && (base..base.saturating_add(n)).any(|i| host.rewritten(i)) {
+                    snapshots.insert(u.slot);
+                    fresh.insert(u.slot);
+                }
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
@@ -1523,7 +1569,18 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let first = if snapshots.contains(slot) {
+                host.dynamic_keeping(n, host.spare() / 4)
+            } else {
+                host.dynamic(n)
+            };
+            let Some(first) = first else {
+                if snapshots.contains(slot) {
+                    for u in entries {
+                        self.table_entry(list, u, compute);
+                    }
+                    continue;
+                }
                 // A table holding constants made from the title's slots
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.

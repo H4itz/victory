@@ -63,6 +63,15 @@ pub(crate) struct HostHeap {
     rewrites_seen: AtomicU64,
     /// The views of memory by address made ([`crate::memory::fill`]).
     memory_seen: Mutex<u64>,
+    /// By title slot: the last record (view index and generation) a draw
+    /// found there, and whether the title has since put another view in the
+    /// slot. A slot so rewritten is one the title reuses within or across
+    /// frames: a draw reading it from the host slot when the list runs reads
+    /// whatever was made there last (see [`HostHeap::rewritten`]).
+    seen: Mutex<Vec<u64>>,
+    rewritten: Box<[std::sync::atomic::AtomicBool]>,
+    /// Dynamic slots taken (by lists not yet reset).
+    in_use: std::sync::atomic::AtomicU32,
 }
 
 /// The dword of the stride table the element counts start at.
@@ -772,6 +781,11 @@ impl HostHeap {
             recheck_at: AtomicU64::new(u64::MAX),
             rewrites_seen: AtomicU64::new(0),
             memory_seen: Mutex::new(0),
+            seen: Mutex::new(if sampler { Vec::new() } else { vec![0; count as usize] }),
+            rewritten: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            in_use: std::sync::atomic::AtomicU32::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -945,6 +959,7 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
+        self.in_use.fetch_add(n as u32, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if !self.sampler {
             static MADE: AtomicU64 = AtomicU64::new(0);
@@ -975,9 +990,58 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            let freed = slots.iter().filter(|t| **t).count() as u32;
             slots.fill(false);
+            let _ = self
+                .in_use
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| Some(u.saturating_sub(freed)));
         }
         guard.2 = usize::MAX;
+    }
+
+    /// As [`HostHeap::dynamic`], but only while `keep` dynamic slots stay
+    /// free after it: tables that may fall back to the title's slots leave
+    /// the last ones to tables that may not (constants).
+    pub(crate) fn dynamic_keeping(&self, n: u32, keep: u32) -> Option<u32> {
+        let in_use = self.in_use.load(Ordering::Relaxed);
+        if in_use.saturating_add(n).saturating_add(keep) > self.spare {
+            return None;
+        }
+        self.dynamic(n)
+    }
+
+    /// The dynamic slots past the title's.
+    pub(crate) fn spare(&self) -> u32 {
+        self.spare
+    }
+
+    /// A draw found record `key` in title slot `index`: if another view was
+    /// there before, the slot is one the title rewrites.
+    fn note_record(&self, index: u32, key: u64) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(last) = seen.get_mut(index as usize) else {
+            return;
+        };
+        if *last != 0 && *last != key && let Some(flag) = self.rewritten.get(index as usize) {
+            #[cfg(feature = "diagnostics")]
+            if !flag.load(Ordering::Relaxed) {
+                static FLAGGED: AtomicU64 = AtomicU64::new(0);
+                let n = FLAGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(slots = n, index, "title view slots seen rewritten");
+                }
+            }
+            flag.store(true, Ordering::Relaxed);
+        }
+        *last = key;
+    }
+
+    /// Whether the title has put another view in slot `index` since a draw
+    /// first read it ([`HostHeap::note_record`]).
+    pub(crate) fn rewritten(&self, index: u32) -> bool {
+        self.rewritten
+            .get(index as usize)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1194,6 +1258,9 @@ impl HostHeap {
             return None;
         };
         let is_buf = !self.sampler && view.is_buffer();
+        if !self.sampler {
+            self.note_record(index, key);
+        }
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let gone = is_buf
